@@ -179,15 +179,98 @@ def set_status(entry_id: int, status: str):
     conn.close()
 
 
-def recent_trucks(user_id: int, limit: int = 20):
+def recent_trucks(user_id: int, limit: int = 30, order: str = "date"):
     conn = db()
+    order_sql = "created_at DESC" if order == "date" else "yuklash COLLATE NOCASE ASC"
     rows = conn.execute(
-        "SELECT * FROM entries WHERE user_id=? AND kind='mashina' "
-        "ORDER BY id DESC LIMIT ?",
+        f"SELECT * FROM entries WHERE user_id=? AND kind='mashina' AND status != 'deleted' "
+        f"ORDER BY {order_sql} LIMIT ?",
         (user_id, limit),
     ).fetchall()
     conn.close()
     return rows
+
+
+def get_entry(entry_id: int):
+    conn = db()
+    row = conn.execute("SELECT * FROM entries WHERE id=?", (entry_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def hard_delete_entry(entry_id: int):
+    conn = db()
+    conn.execute("DELETE FROM entries WHERE id=?", (entry_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_old_trucks(user_id: int, days: int = 3) -> int:
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "DELETE FROM entries WHERE user_id=? AND kind='mashina' AND created_at < ?",
+        (user_id, cutoff),
+    )
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n
+
+
+def delete_all_trucks(user_id: int) -> int:
+    conn = db()
+    cur = conn.execute("DELETE FROM entries WHERE user_id=? AND kind='mashina'", (user_id,))
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n
+
+
+def expire_old_entries(days: int = 7) -> int:
+    """11-band: 7 kundan eski faol yozuvlarni avtomatik olib tashlaydi."""
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "DELETE FROM entries WHERE created_at < ? AND status != 'deleted'", (cutoff,)
+    )
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n
+
+
+def find_matching_trucks(user_id: int, yuklash: str, manzil: str):
+    """12-band: yangi zaprosga mos saqlangan mashina bormi, tekshiradi."""
+    if not yuklash or not manzil:
+        return []
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM entries WHERE user_id=? AND kind='mashina' AND status='active' "
+        "AND yuklash IS NOT NULL AND manzil IS NOT NULL",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    y_key, m_key = normalize_city(yuklash), normalize_city(manzil)
+    return [
+        r for r in rows
+        if normalize_city(r["yuklash"]) == y_key and normalize_city(r["manzil"]) == m_key
+    ]
+
+
+def time_ago(created_at: str) -> str:
+    try:
+        then = datetime.fromisoformat(created_at)
+    except Exception:
+        return ""
+    now = datetime.now(TZ) if TZ and then.tzinfo else datetime.now()
+    delta = now - then if then.tzinfo == now.tzinfo else datetime.now() - then.replace(tzinfo=None)
+    seconds = max(delta.total_seconds(), 0)
+    if seconds < 3600:
+        return f"{int(seconds // 60)} daqiqa oldin"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} soat oldin"
+    return f"{int(seconds // 86400)} kun oldin"
 
 
 def stats_between(start: datetime, end: datetime):
@@ -241,6 +324,29 @@ UI = {
     "delete_btn": {"uz": "\U0001F5D1 Kanaldan o'chirish", "ru": "\U0001F5D1 \u0423\u0434\u0430\u043b\u0438\u0442\u044c \u0438\u0437 \u043a\u0430\u043d\u0430\u043b\u0430"},
     "deleted": {"uz": "O'chirildi.", "ru": "\u0423\u0434\u0430\u043b\u0435\u043d\u043e."},
     "send_all": {"uz": "\u2705 Barchasini yuborish", "ru": "\u2705 \u041e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0432\u0441\u0451"},
+    "no_trucks": {"uz": "Ro'yxat bo'sh.", "ru": "\u0421\u043f\u0438\u0441\u043e\u043a \u043f\u0443\u0441\u0442."},
+    "truck_count": {"uz": "ta faol mashina", "ru": "\u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u043c\u0430\u0448\u0438\u043d"},
+    "sort_by_date": {"uz": "\U0001F4C5 Sana bo'yicha", "ru": "\U0001F4C5 \u041f\u043e \u0434\u0430\u0442\u0435"},
+    "sort_by_city": {"uz": "\U0001F4CD Shahar bo'yicha", "ru": "\U0001F4CD \u041f\u043e \u0433\u043e\u0440\u043e\u0434\u0443"},
+    "clear_old": {"uz": "\U0001F9F9 Eskilarini tozalash", "ru": "\U0001F9F9 \u041e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0441\u0442\u0430\u0440\u044b\u0435"},
+    "clear_all": {"uz": "\U0001F5D1 Barchasini o'chirish", "ru": "\U0001F5D1 \u0423\u0434\u0430\u043b\u0438\u0442\u044c \u0432\u0441\u0435"},
+    "truck_delete": {"uz": "\U0001F5D1 O'chirish", "ru": "\U0001F5D1 \u0423\u0434\u0430\u043b\u0438\u0442\u044c"},
+    "truck_edit": {"uz": "\u270F\uFE0F Tahrirlash", "ru": "\u270F\uFE0F \u0418\u0437\u043c\u0435\u043d\u0438\u0442\u044c"},
+    "truck_mark_taken": {"uz": "\U0001F534 Band qildim", "ru": "\U0001F534 \u0417\u0430\u043d\u044f\u0442\u043e"},
+    "truck_mark_free": {"uz": "\U0001F7E2 Bo'shadi", "ru": "\U0001F7E2 \u0421\u0432\u043e\u0431\u043e\u0434\u043d\u043e"},
+    "truck_copy": {"uz": "\U0001F4CB Nusxalash", "ru": "\U0001F4CB \u041a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c"},
+    "truck_post": {"uz": "\U0001F4E4 Kanalga joylash", "ru": "\U0001F4E4 \u041e\u043f\u0443\u0431\u043b\u0438\u043a\u043e\u0432\u0430\u0442\u044c \u0432 \u043a\u0430\u043d\u0430\u043b"},
+    "truck_deleted": {"uz": "O'chirildi \u2705", "ru": "\u0423\u0434\u0430\u043b\u0435\u043d\u043e \u2705"},
+    "truck_status_band": {"uz": "\U0001F534 BAND", "ru": "\U0001F534 \u0417\u0410\u041d\u042f\u0422\u041e"},
+    "truck_status_free": {"uz": "\U0001F7E2 BO'SH", "ru": "\U0001F7E2 \u0421\u0412\u041e\u0411\u041e\u0414\u041d\u041e"},
+    "cleared_old": {"uz": "yozuv o'chirildi (3 kundan eski)", "ru": "\u0437\u0430\u043f\u0438\u0441\u0435\u0439 \u0443\u0434\u0430\u043b\u0435\u043d\u043e (\u0441\u0442\u0430\u0440\u0448\u0435 3 \u0434\u043d\u0435\u0439)"},
+    "cleared_all": {"uz": "yozuv butunlay o'chirildi", "ru": "\u0437\u0430\u043f\u0438\u0441\u0435\u0439 \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u0443\u0434\u0430\u043b\u0435\u043d\u043e"},
+    "match_found": {
+        "uz": "\U0001F50E Ro'yxatingizda mos keladigan mashina bor:",
+        "ru": "\U0001F50E \u0412 \u0432\u0430\u0448\u0435\u043c \u0441\u043f\u0438\u0441\u043a\u0435 \u0435\u0441\u0442\u044c \u043f\u043e\u0434\u0445\u043e\u0434\u044f\u0449\u0430\u044f \u043c\u0430\u0448\u0438\u043d\u0430:",
+    },
+    "posted_to_channel": {"uz": "Kanalga joylandi \u2705", "ru": "\u041e\u043f\u0443\u0431\u043b\u0438\u043a\u043e\u0432\u0430\u043d\u043e \u0432 \u043a\u0430\u043d\u0430\u043b \u2705"},
+    "copied": {"uz": "Matn quyida, nusxalab oling:", "ru": "\u0422\u0435\u043a\u0441\u0442 \u043d\u0438\u0436\u0435, \u0441\u043a\u043e\u043f\u0438\u0440\u0443\u0439\u0442\u0435:"},
 }
 
 
@@ -373,7 +479,9 @@ MUHIM qoidalar:
 MUHIM: yuklash, manzil, yuk_turi, mashina_turi, tolov — bu matn maydonlarining \
 barchasini FAQAT KIRILL alifbosida qaytar, hatto foydalanuvchi lotin yozuvida \
 yozgan bo'lsa ham. Aniq tanib bo'lmasa, harflarini kirillga almashtirib yoz.
-Noaniq maydonni taxmin qilma — null qoldir.
+Noaniq maydonni taxmin qilma — null qoldir. HECH QACHON matnda yo'q raqam yoki \
+tafsilotni o'zingdan to'qib chiqarma — masalan matnda faqat "yuk bor" deyilgan \
+bo'lsa-yu, tonna yoki kub aytilmagan bo'lsa, ularni albatta null qoldir.
 
 Matn: "{text}"
 """
@@ -419,10 +527,24 @@ def parse_with_claude(text: str) -> dict:
 
 def parse_text(text: str) -> dict:
     try:
-        return parse_with_claude(text) if ANTHROPIC_API_KEY else fallback_parse(text)
+        p = parse_with_claude(text) if ANTHROPIC_API_KEY else fallback_parse(text)
     except Exception:
         log.exception("parse xatosi")
-        return fallback_parse(text)
+        p = fallback_parse(text)
+    return sanitize_numbers(p, text)
+
+
+def sanitize_numbers(p: dict, text: str) -> dict:
+    """AI matnda yo'q raqamni o'ylab topmasligi uchun tekshiruv."""
+    for key in ("soni", "dona", "tonna", "kub"):
+        val = p.get(key)
+        if val is None:
+            continue
+        as_int = str(int(val)) if float(val).is_integer() else None
+        as_float = str(val)
+        if not (as_float in text or (as_int and as_int in text)):
+            p[key] = None
+    return p
 
 
 def is_ambiguous(p: dict) -> bool:
@@ -526,13 +648,50 @@ async def cmd_til(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Til tanlang: /til uz  yoki  /til ru")
 
 
-async def cmd_moshinalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = recent_trucks(update.effective_user.id)
+def truck_keyboard(user_id: int, row) -> InlineKeyboardMarkup:
+    band = row["status"] == "band"
+    status_btn = (
+        InlineKeyboardButton(t("truck_mark_free", user_id), callback_data=f"tband:{row['id']}:0")
+        if band else
+        InlineKeyboardButton(t("truck_mark_taken", user_id), callback_data=f"tband:{row['id']}:1")
+    )
+    return InlineKeyboardMarkup([
+        [status_btn, InlineKeyboardButton(t("truck_edit", user_id), callback_data=f"tedit:{row['id']}")],
+        [InlineKeyboardButton(t("truck_copy", user_id), callback_data=f"tcopy:{row['id']}"),
+         InlineKeyboardButton(t("truck_post", user_id), callback_data=f"tpost:{row['id']}")],
+        [InlineKeyboardButton(t("truck_delete", user_id), callback_data=f"tdel:{row['id']}")],
+    ])
+
+
+def truck_entry_text(row) -> str:
+    tag = "\U0001F534 BAND\n" if row["status"] == "band" else ""
+    ago = time_ago(row["created_at"])
+    return f"{tag}{row['template']}\n\U0001F553 {ago}"
+
+
+async def send_truck_list(message_or_query, user_id: int, chat_id: int, context, order: str = "date"):
+    rows = recent_trucks(user_id, order=order)
     if not rows:
-        await update.message.reply_text("Ro'yxat bo'sh.")
+        await context.bot.send_message(chat_id, t("no_trucks", user_id))
         return
-    chunks = [r["template"] for r in rows]
-    await update.message.reply_text("\n\n\u2015\u2015\u2015\n\n".join(chunks))
+    header = f"\U0001F69B {len(rows)} {t('truck_count', user_id)}"
+    await context.bot.send_message(
+        chat_id, header,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(t("sort_by_date", user_id), callback_data="tsort:date"),
+             InlineKeyboardButton(t("sort_by_city", user_id), callback_data="tsort:city")],
+            [InlineKeyboardButton(t("clear_old", user_id), callback_data="tclearold"),
+             InlineKeyboardButton(t("clear_all", user_id), callback_data="tclearall")],
+        ]),
+    )
+    for row in rows:
+        await context.bot.send_message(
+            chat_id, truck_entry_text(row), reply_markup=truck_keyboard(user_id, row)
+        )
+
+
+async def cmd_moshinalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_truck_list(update, update.effective_user.id, update.effective_chat.id, context)
 
 
 async def cmd_stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -622,6 +781,11 @@ async def present_entry(update: Update, user_id: int, kind: str, p: dict):
         f"{t('template_ready', user_id)}\n\n{p['_template']}\n\n{label}",
         reply_markup=confirm_keyboard(user_id, kind, token),
     )
+    if kind == "zapros":
+        matches = find_matching_trucks(user_id, p.get("yuklash"), p.get("manzil"))
+        if matches:
+            preview = "\n\n\u2015\u2015\u2015\n\n".join(m["template"] for m in matches[:3])
+            await update.message.reply_text(f"{t('match_found', user_id)}\n\n{preview}")
     await send_trip_info(update, p)
 
 
@@ -686,6 +850,11 @@ async def handle_kind_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await context.bot.send_message(
         chat_id, label, reply_markup=confirm_keyboard(user_id, kind, token)
     )
+    if kind == "zapros":
+        matches = find_matching_trucks(user_id, p.get("yuklash"), p.get("manzil"))
+        if matches:
+            preview = "\n\n\u2015\u2015\u2015\n\n".join(m["template"] for m in matches[:3])
+            await context.bot.send_message(chat_id, f"{t('match_found', user_id)}\n\n{preview}")
 
 
 async def deliver_entry(context, user_id: int, kind: str, p: dict):
@@ -724,6 +893,66 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 log.exception("multi yuborishda xato")
         await query.edit_message_text(f"{sent}/{len(entries)} ta yozuv qayta ishlandi \u2705")
+        return
+
+    if data.startswith("tsort:"):
+        order = data.split(":")[1]
+        await send_truck_list(update, user_id, chat_id, context, order=order)
+        return
+
+    if data == "tclearold":
+        n = delete_old_trucks(user_id, days=3)
+        await query.edit_message_text(f"{n} {t('cleared_old', user_id)}")
+        return
+
+    if data == "tclearall":
+        n = delete_all_trucks(user_id)
+        await query.edit_message_text(f"{n} {t('cleared_all', user_id)}")
+        return
+
+    if data.startswith("tdel:"):
+        entry_id = int(data.split(":")[1])
+        hard_delete_entry(entry_id)
+        await query.edit_message_text(t("truck_deleted", user_id))
+        return
+
+    if data.startswith("tband:"):
+        _, entry_id, flag = data.split(":")
+        row = get_entry(int(entry_id))
+        if row:
+            set_status(int(entry_id), "band" if flag == "1" else "active")
+            row = get_entry(int(entry_id))
+            await query.edit_message_text(
+                truck_entry_text(row), reply_markup=truck_keyboard(user_id, row)
+            )
+        return
+
+    if data.startswith("tedit:"):
+        entry_id = int(data.split(":")[1])
+        row = get_entry(entry_id)
+        if row:
+            hard_delete_entry(entry_id)
+            AWAITING_EDIT[chat_id] = True
+            await query.edit_message_text(t("edit_prompt", user_id))
+        return
+
+    if data.startswith("tcopy:"):
+        entry_id = int(data.split(":")[1])
+        row = get_entry(entry_id)
+        if row:
+            await query.answer(t("copied", user_id), show_alert=False)
+            await context.bot.send_message(chat_id, row["template"])
+        return
+
+    if data.startswith("tpost:"):
+        entry_id = int(data.split(":")[1])
+        row = get_entry(entry_id)
+        if row and CHANNEL_ID:
+            try:
+                await context.bot.send_message(chat_id=CHANNEL_ID, text=row["template"])
+                await query.answer(t("posted_to_channel", user_id), show_alert=False)
+            except Exception:
+                log.exception("kanalga joylashda xato")
         return
 
     action, token = (data.split(":", 1) + [None])[:2]
@@ -814,7 +1043,10 @@ async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
     await notify_admin(context, text)
 
 
-async def weekly_summary_job(context: ContextTypes.DEFAULT_TYPE):
+async def expire_job(context: ContextTypes.DEFAULT_TYPE):
+    n = expire_old_entries(days=7)
+    if n:
+        log.info("Avtomatik tozalash: %s ta eski yozuv o'chirildi", n)
     now = datetime.now(TZ) if TZ else datetime.now()
     week_ago = now - timedelta(days=7)
     s = stats_between(week_ago, now)
@@ -860,6 +1092,9 @@ def main():
             weekly_summary_job, time=dtime(hour=DAILY_SUMMARY_HOUR, tzinfo=TZ),
             days=(0,),  # dushanba
         )
+        app.job_queue.run_daily(
+            expire_job, time=dtime(hour=3, tzinfo=TZ)
+        )
 
     log.info("Bot ishga tushdi")
     app.run_polling()
@@ -867,4 +1102,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
