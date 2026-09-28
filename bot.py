@@ -1047,6 +1047,9 @@ async def expire_job(context: ContextTypes.DEFAULT_TYPE):
     n = expire_old_entries(days=7)
     if n:
         log.info("Avtomatik tozalash: %s ta eski yozuv o'chirildi", n)
+
+
+async def weekly_summary_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TZ) if TZ else datetime.now()
     week_ago = now - timedelta(days=7)
     s = stats_between(week_ago, now)
