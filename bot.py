@@ -43,8 +43,10 @@ import sqlite3
 from datetime import datetime, timedelta, time as dtime
 
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ParseMode
@@ -85,7 +87,9 @@ TZ = ZoneInfo(TIMEZONE_NAME) if ZoneInfo else None
 DB_PATH = os.environ.get("DB_PATH", "yuk_bot.db")
 
 # {chat_id: True}  — "Tahrirlash" bosilgach, keyingi xabar qayta ishlanadi
-AWAITING_EDIT: dict[int, bool] = {}
+AWAITING_EDIT: dict[int, object] = {}  # tur (zapros/mashina) yoki True
+# {chat_id: 'zapros' | 'mashina'}  — menyu tugmasi bosilgach, keyingi xabar shu turda
+MODE: dict[int, str] = {}
 # {chat_id: [entry, entry, ...]}  — ko'p yozuvli xabar tasdiqni kutmoqda
 PENDING_MULTI: dict[int, list] = {}
 # {chat_id: text}  — turi (zapros/mashina) noaniq, tugma orqali so'ralmoqda
@@ -189,6 +193,16 @@ def recent_trucks(user_id: int, limit: int = 30, order: str = "date"):
     ).fetchall()
     conn.close()
     return rows
+
+
+def count_active_trucks(user_id: int) -> int:
+    conn = db()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM entries WHERE user_id=? AND kind='mashina' AND status='active'",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return row["c"] if row else 0
 
 
 def get_entry(entry_id: int):
@@ -324,6 +338,13 @@ UI = {
     "delete_btn": {"uz": "\U0001F5D1 Kanaldan o'chirish", "ru": "\U0001F5D1 \u0423\u0434\u0430\u043b\u0438\u0442\u044c \u0438\u0437 \u043a\u0430\u043d\u0430\u043b\u0430"},
     "deleted": {"uz": "O'chirildi.", "ru": "\u0423\u0434\u0430\u043b\u0435\u043d\u043e."},
     "send_all": {"uz": "\u2705 Barchasini yuborish", "ru": "\u2705 \u041e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0432\u0441\u0451"},
+    "photo_need_key": {
+        "uz": "\U0001F4F7 Rasmni o'qish uchun AI kaliti (ANTHROPIC_API_KEY) kerak. Hozircha xabarni matn qilib yozing.",
+        "ru": "\U0001F4F7 \u0414\u043b\u044f \u0447\u0442\u0435\u043d\u0438\u044f \u0444\u043e\u0442\u043e \u043d\u0443\u0436\u0435\u043d \u043a\u043b\u044e\u0447 AI. \u041f\u043e\u043a\u0430 \u043d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u0442\u0435\u043a\u0441\u0442\u043e\u043c.",
+    },
+    "reading_photo": {"uz": "\U0001F4F7 Rasm o'qilmoqda...", "ru": "\U0001F4F7 \u0427\u0438\u0442\u0430\u044e \u0444\u043e\u0442\u043e..."},
+    "photo_failed": {"uz": "Rasmni o'qib bo'lmadi, qayta urinib ko'ring yoki matn yozing.", "ru": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u0440\u043e\u0447\u0438\u0442\u0430\u0442\u044c \u0444\u043e\u0442\u043e."},
+    "photo_nothing": {"uz": "Rasmda yuk yoki mashina haqida matn topilmadi.", "ru": "\u041d\u0430 \u0444\u043e\u0442\u043e \u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445 \u043e \u0433\u0440\u0443\u0437\u0435 \u0438\u043b\u0438 \u043c\u0430\u0448\u0438\u043d\u0435."},
     "no_trucks": {"uz": "Ro'yxat bo'sh.", "ru": "\u0421\u043f\u0438\u0441\u043e\u043a \u043f\u0443\u0441\u0442."},
     "truck_count": {"uz": "ta faol mashina", "ru": "\u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u043c\u0430\u0448\u0438\u043d"},
     "sort_by_date": {"uz": "\U0001F4C5 Sana bo'yicha", "ru": "\U0001F4C5 \u041f\u043e \u0434\u0430\u0442\u0435"},
@@ -356,40 +377,257 @@ def t(key: str, user_id: int) -> str:
 
 
 # --------------------------------------------------------------------------
-# Shahar koordinatalari (51/52/59-band: taxminiy masofa/yoqilg'i/vaqt)
+# Joylar: shahar/davlat lug'ati (nom + davlat + koordinata). AI kalitsiz ham
+# shaharni topish, shahar yoniga davlatni yozish va masofani hisoblash uchun.
+# Yangi shahar qo'shish: PLACES ro'yxatiga bitta qator qo'shing.
 # --------------------------------------------------------------------------
 
-CITY_COORDS = {
-    "toshkent": (41.2995, 69.2401), "самарканд": (39.6542, 66.9597),
-    "samarqand": (39.6542, 66.9597), "buxoro": (39.7747, 64.4286),
-    "qarshi": (38.8606, 65.7891), "карши": (38.8606, 65.7891),
-    "termiz": (37.2242, 67.2783), "nukus": (42.4600, 59.6100),
-    "urganch": (41.5500, 60.6333), "xiva": (41.3783, 60.3639),
-    "namangan": (40.9983, 71.6726), "andijon": (40.7833, 72.3333),
-    "farg'ona": (40.3833, 71.7833), "fargona": (40.3833, 71.7833),
-    "jizzax": (40.1158, 67.8422), "guliston": (40.4897, 68.7842),
-    "navoiy": (40.1030, 65.3686),
-    "alashankou": (45.1800, 82.5700), "алашанькоу": (45.1800, 82.5700),
-    "улугчат": (45.1800, 82.5700), "ulug'chat": (45.1800, 82.5700),
-    "moskva": (55.7558, 37.6173), "москва": (55.7558, 37.6173),
-    "praga": (50.0755, 14.4378), "прага": (50.0755, 14.4378),
-    "varshava": (52.2297, 21.0122), "almaty": (43.2220, 76.8512),
-    "bishkek": (42.8746, 74.5698), "yiwu": (29.3060, 120.0762),
-}
+# (ko'rsatiladigan nom, davlat, (lat, lon), [yozilish variantlari])
+PLACES = [
+    # --- O'zbekiston ---
+    ("Тошкент", "Ўзбекистон", (41.2995, 69.2401), ["toshkent", "tashkent", "ташкент", "тошкент"]),
+    ("Самарқанд", "Ўзбекистон", (39.6542, 66.9597), ["samarqand", "samarkand", "самарканд", "самарқанд"]),
+    ("Бухоро", "Ўзбекистон", (39.7747, 64.4286), ["buxoro", "bukhara", "buxara", "бухара", "бухоро"]),
+    ("Қарши", "Ўзбекистон", (38.8606, 65.7891), ["qarshi", "karshi", "карши", "қарши"]),
+    ("Термиз", "Ўзбекистон", (37.2242, 67.2783), ["termiz", "termez", "термез", "термиз"]),
+    ("Нукус", "Ўзбекистон", (42.4600, 59.6100), ["nukus", "нукус"]),
+    ("Урганч", "Ўзбекистон", (41.5500, 60.6333), ["urganch", "urgench", "ургенч", "урганч"]),
+    ("Хива", "Ўзбекистон", (41.3783, 60.3639), ["xiva", "khiva", "хива"]),
+    ("Наманган", "Ўзбекистон", (40.9983, 71.6726), ["namangan", "наманган"]),
+    ("Андижон", "Ўзбекистон", (40.7833, 72.3333), ["andijon", "andijan", "андижан", "андижон"]),
+    ("Фарғона", "Ўзбекистон", (40.3833, 71.7833), ["farg'ona", "fargona", "fergana", "фергана", "фарғона"]),
+    ("Жиззах", "Ўзбекистон", (40.1158, 67.8422), ["jizzax", "jizzakh", "dzhizak", "джизак", "жиззах"]),
+    ("Гулистон", "Ўзбекистон", (40.4897, 68.7842), ["guliston", "gulistan", "гулистан", "гулистон"]),
+    ("Навоий", "Ўзбекистон", (40.1030, 65.3686), ["navoiy", "navoi", "навои", "навоий"]),
+    ("Ангрен", "Ўзбекистон", (41.0167, 70.1436), ["angren", "ангрен"]),
+    ("Чирчиқ", "Ўзбекистон", (41.4689, 69.5822), ["chirchiq", "chirchik", "чирчик", "чирчиқ"]),
+    ("Олмалиқ", "Ўзбекистон", (40.8447, 69.5983), ["olmaliq", "almalyk", "алмалык", "олмалик", "олмалиқ"]),
+    ("Марғилон", "Ўзбекистон", (40.4711, 71.7246), ["margilon", "margilan", "маргилан", "марғилон"]),
+    ("Қўқон", "Ўзбекистон", (40.5286, 70.9425), ["qo'qon", "qoqon", "kokand", "коканд", "қўқон"]),
+    ("Денов", "Ўзбекистон", (38.2667, 67.9000), ["denov", "денов"]),
+    ("Шаҳрисабз", "Ўзбекистон", (39.0578, 66.8342), ["shahrisabz", "шахрисабз", "шаҳрисабз"]),
+    # --- Қозоғистон ---
+    ("Алматы", "Қозоғистон", (43.2220, 76.8512), ["almaty", "алматы"]),
+    ("Астана", "Қозоғистон", (51.1694, 71.4491), ["astana", "астана"]),
+    ("Шымкент", "Қозоғистон", (42.3417, 69.5901), ["shymkent", "shimkent", "chimkent", "шымкент", "чимкент"]),
+    ("Актау", "Қозоғистон", (43.6500, 51.1500), ["aktau", "актау"]),
+    ("Актобе", "Қозоғистон", (50.2839, 57.1670), ["aktobe", "актобе"]),
+    ("Қарағанда", "Қозоғистон", (49.8060, 73.0850), ["karaganda", "qaraganda", "караганда"]),
+    # --- Қирғизистон ---
+    ("Бишкек", "Қирғизистон", (42.8746, 74.5698), ["bishkek", "бишкек"]),
+    ("Ош", "Қирғизистон", (40.5283, 72.7985), ["osh", "ош"]),
+    ("Иркештам", "Қирғизистон", (39.6833, 73.9333), ["irkeshtam", "иркештам"]),
+    # --- Хитой ---
+    ("Иу", "Хитой", (29.3060, 120.0762), ["yiwu", "iwu", "иу", "ию"]),
+    ("Алашанькоу", "Хитой", (45.1800, 82.5700), ["alashankou", "alashankov", "алашанькоу", "алашанкоу"]),
+    ("Улугчат", "Хитой", (39.7200, 75.2500), ["ulug'chat", "ulugchat", "ulugqat", "wuqia", "улугчат", "улуғчат"]),
+    ("Урумчи", "Хитой", (43.8256, 87.6168), ["urumqi", "urumchi", "урумчи"]),
+    ("Гуанчжоу", "Хитой", (23.1291, 113.2644), ["guangzhou", "guanchjou", "гуанчжоу", "гуанджоу"]),
+    ("Кашгар", "Хитой", (39.4704, 75.9898), ["kashgar", "qashqar", "кашгар"]),
+    ("Шанхай", "Хитой", (31.2304, 121.4737), ["shanghai", "shanxay", "шанхай"]),
+    # --- Россия ---
+    ("Москва", "Россия", (55.7558, 37.6173), ["moskva", "moscow", "москва"]),
+    ("Санкт-Петербург", "Россия", (59.9343, 30.3351), ["peterburg", "piter", "петербург", "питер"]),
+    ("Пятигорск", "Россия", (44.0486, 43.0594), ["pyatigorsk", "pyatigorsk", "пятигорск"]),
+    ("Краснодар", "Россия", (45.0355, 38.9753), ["krasnodar", "краснодар"]),
+    ("Новосибирск", "Россия", (55.0084, 82.9357), ["novosibirsk", "новосибирск"]),
+    ("Екатеринбург", "Россия", (56.8389, 60.6057), ["yekaterinburg", "ekaterinburg", "екатеринбург"]),
+    ("Казань", "Россия", (55.7887, 49.1221), ["kazan", "казань"]),
+    ("Ростов", "Россия", (47.2357, 39.7015), ["rostov", "ростов"]),
+    ("Самара", "Россия", (53.1959, 50.1002), ["samara", "самара"]),
+    ("Волгоград", "Россия", (48.7080, 44.5133), ["volgograd", "волгоград"]),
+    ("Челябинск", "Россия", (55.1644, 61.4368), ["chelyabinsk", "челябинск"]),
+    ("Омск", "Россия", (54.9885, 73.3242), ["omsk", "омск"]),
+    ("Уфа", "Россия", (54.7388, 55.9721), ["ufa", "уфа"]),
+    ("Ставрополь", "Россия", (45.0428, 41.9734), ["stavropol", "ставрополь"]),
+    ("Новороссийск", "Россия", (44.7235, 37.7687), ["novorossiysk", "новороссийск"]),
+    ("Астрахань", "Россия", (46.3497, 48.0408), ["astrakhan", "astraxan", "астрахань"]),
+    ("Воронеж", "Россия", (51.6720, 39.1843), ["voronezh", "воронеж"]),
+    # --- Беларусь ---
+    ("Минск", "Беларусь", (53.9006, 27.5590), ["minsk", "минск"]),
+    ("Брест", "Беларусь", (52.0976, 23.7341), ["brest", "брест"]),
+    # --- Польша ---
+    ("Варшава", "Польша", (52.2297, 21.0122), ["varshava", "warsaw", "варшава"]),
+    ("Малашевичи", "Польша", (52.2000, 23.5500), ["malashevichi", "малашевичи"]),
+    # --- Чехия ---
+    ("Прага", "Чехия", (50.0755, 14.4378), ["praga", "prague", "прага"]),
+    ("Брно", "Чехия", (49.1951, 16.6068), ["brno", "брно"]),
+    # --- Германия ---
+    ("Берлин", "Германия", (52.5200, 13.4050), ["berlin", "берлин"]),
+    ("Гамбург", "Германия", (53.5511, 9.9937), ["hamburg", "gamburg", "гамбург"]),
+    ("Мюнхен", "Германия", (48.1351, 11.5820), ["munich", "myunxen", "мюнхен"]),
+    ("Франкфурт", "Германия", (50.1109, 8.6821), ["frankfurt", "франкфурт"]),
+    # --- Туркия ---
+    ("Стамбул", "Туркия", (41.0082, 28.9784), ["istanbul", "istambul", "stambul", "стамбул"]),
+    ("Анкара", "Туркия", (39.9334, 32.8597), ["ankara", "анкара"]),
+    ("Мерсин", "Туркия", (36.8121, 34.6415), ["mersin", "мерсин"]),
+    ("Измир", "Туркия", (38.4237, 27.1428), ["izmir", "измир"]),
+    # --- Кавказ, Ўрта Осиё, Эрон, Афғонистон ---
+    ("Баку", "Озарбайжон", (40.4093, 49.8671), ["boku", "baku", "баку"]),
+    ("Тбилиси", "Грузия", (41.7151, 44.8271), ["tbilisi", "тбилиси"]),
+    ("Поти", "Грузия", (42.1467, 41.6719), ["poti", "поти"]),
+    ("Батуми", "Грузия", (41.6168, 41.6367), ["batumi", "батуми"]),
+    ("Душанбе", "Тожикистон", (38.5598, 68.7870), ["dushanbe", "душанбе"]),
+    ("Хужанд", "Тожикистон", (40.2826, 69.6220), ["xo'jand", "xujand", "hujand", "худжанд", "хужанд"]),
+    ("Ашхабад", "Туркманистон", (37.9601, 58.3261), ["ashgabat", "ashxabod", "ашхабад"]),
+    ("Кобул", "Афғонистон", (34.5553, 69.2075), ["kobul", "kabul", "кабул", "кобул"]),
+    ("Хайратон", "Афғонистон", (37.2333, 67.7833), ["hayraton", "hairatan", "хайратон"]),
+    ("Тахрон", "Эрон", (35.6892, 51.3890), ["tehron", "tehran", "тегеран", "тахрон"]),
+]
+
+# Davlatlarning o'zi ham manzil bo'lishi mumkin ("Чехияга юради").
+# (ko'rsatiladigan nom, [yozilish variantlari])
+COUNTRIES = [
+    ("Ўзбекистон", ["o'zbekiston", "ozbekiston", "uzbekistan", "узбекистан", "ўзбекистон", "узбекистон"]),
+    ("Россия", ["rossiya", "russia", "россия", "росия"]),
+    ("Қозоғистон", ["qozog'iston", "qozogiston", "kazakhstan", "казахстан", "қозоғистон", "козогистон"]),
+    ("Қирғизистон", ["qirg'iziston", "qirgiziston", "kyrgyzstan", "киргизия", "киргизстан", "қирғизистон", "кыргызстан"]),
+    ("Тожикистон", ["tojikiston", "tajikistan", "таджикистан", "тожикистон"]),
+    ("Туркманистон", ["turkmaniston", "turkmenistan", "туркменистан", "туркманистон"]),
+    ("Хитой", ["xitoy", "china", "китай", "хитой"]),
+    ("Туркия", ["turkiya", "turkey", "турция", "туркия"]),
+    ("Германия", ["germaniya", "germany", "германия"]),
+    ("Польша", ["polsha", "poland", "польша", "полша"]),
+    ("Чехия", ["chexiya", "chehiya", "czechia", "чехия"]),
+    ("Беларусь", ["belarus", "belorussiya", "беларусь", "беларус", "белоруссия"]),
+    ("Озарбайжон", ["ozarbayjon", "azerbaijan", "азербайджан", "озарбайжон"]),
+    ("Грузия", ["gruziya", "georgia", "грузия"]),
+    ("Афғонистон", ["afg'oniston", "afgoniston", "afghanistan", "афганистан", "афғонистон"]),
+    ("Эрон", ["eron", "iran", "иран", "эрон"]),
+    ("Италия", ["italiya", "italy", "италия"]),
+    ("Франция", ["fransiya", "france", "франция"]),
+    ("Испания", ["ispaniya", "spain", "испания"]),
+    ("Нидерландия", ["niderlandiya", "gollandiya", "netherlands", "нидерланды", "голландия"]),
+    ("Литва", ["litva", "lithuania", "литва"]),
+    ("Латвия", ["latviya", "latvia", "латвия"]),
+    ("Венгрия", ["vengriya", "hungary", "венгрия"]),
+    ("Словакия", ["slovakiya", "slovakia", "словакия"]),
+    ("Болгария", ["bolgariya", "bulgaria", "болгария"]),
+    ("Руминия", ["ruminiya", "romania", "румыния"]),
+    ("Австрия", ["avstriya", "austria", "австрия"]),
+    ("Сербия", ["serbiya", "serbia", "сербия"]),
+]
 
 
 def normalize_city(name: str) -> str:
+    """Kichik harf, faqat harf/raqam (apostrof, bo'shliq, chiziqchalar olib tashlanadi)."""
     if not name:
         return ""
-    return re.sub(r"[^\w']", "", name.lower())
+    return re.sub(r"[\W_]", "", name.lower())
 
 
-def find_city_coords(name: str):
-    key = normalize_city(name)
-    for city_key, coords in CITY_COORDS.items():
-        if normalize_city(city_key) == key or key in normalize_city(city_key):
-            return coords
-    return None
+class Place:
+    def __init__(self, display, country, coords):
+        self.display = display
+        self.country = country
+        self.coords = coords
+
+
+def _build_place_index():
+    index = {}
+    for display, country, coords, aliases in PLACES:
+        place = Place(display, country, coords)
+        for a in aliases + [display]:
+            index[normalize_city(a)] = place
+    for display, aliases in COUNTRIES:
+        place = Place(display, display, None)
+        for a in aliases + [display]:
+            index[normalize_city(a)] = place
+    return index
+
+
+PLACE_INDEX = _build_place_index()
+
+# Qo'shimchalar: -dan/-да (qayerdan), -da/-да (qayerda), -ga/-га (qayerga)
+_SUF_FROM = {"dan", "дан", "den", "дэн"}
+_SUF_AT = {"da", "да", "dagi", "даги", "дагы"}
+_SUF_TO = {"ga", "ka", "qa", "га", "ка", "қа", "gacha", "гача"}
+_SUF_NEUTRAL = {"", "ni", "ни", "ning", "нинг", "dir", "дир"}
+_SUF_ALL = _SUF_FROM | _SUF_AT | _SUF_TO | _SUF_NEUTRAL
+_RU_END = {"у", "ы", "е", "ой", "ю", "и", "ом"}
+_PREV_FROM = {"из", "от", "с", "со", "from"}
+_PREV_TO = {"в", "во", "до", "на", "к", "ко", "to"}
+
+
+def match_place(word_norm: str):
+    """So'zni lug'atdagi joyga moslaydi. (Place, qo'shimcha) yoki None."""
+    if not word_norm or word_norm.isdigit():
+        return None
+    if word_norm in PLACE_INDEX:
+        return PLACE_INDEX[word_norm], ""
+    best = None
+    for alias, place in PLACE_INDEX.items():
+        if len(alias) < 2:
+            continue
+        if word_norm.startswith(alias):
+            rest = word_norm[len(alias):]
+            if rest in _SUF_ALL and (best is None or len(alias) > best[0]):
+                best = (len(alias), place, rest)
+        # Ruscha: Москву, Праге, Москвы ...
+        if len(alias) >= 3 and alias[-1] in ("а", "я"):
+            stem = alias[:-1]
+            if word_norm.startswith(stem):
+                rest = word_norm[len(stem):]
+                if rest in _RU_END and (best is None or len(stem) > best[0]):
+                    best = (len(stem), place, "")
+    return (best[1], best[2]) if best else None
+
+
+def lookup_place(name: str):
+    """Nom bo'yicha joyni topadi (qo'shimchali yozuv ham bo'ladi)."""
+    if not name:
+        return None
+    m = match_place(normalize_city(name))
+    return m[0] if m else None
+
+
+def find_places(text: str):
+    """Matndagi barcha joylarni tartib bilan topadi: [{place, hint}]."""
+    tokens = re.findall(r"[\w'’ʼ`]+", text)
+    found, seen = [], set()
+    for i, tok in enumerate(tokens):
+        m = match_place(normalize_city(tok))
+        if not m:
+            continue
+        place, suffix = m
+        if place.display in seen:
+            continue
+        seen.add(place.display)
+        hint = None
+        if suffix in _SUF_FROM or suffix in _SUF_AT:
+            hint = "from"
+        elif suffix in _SUF_TO:
+            hint = "to"
+        elif i > 0:
+            prev = normalize_city(tokens[i - 1])
+            if prev in _PREV_FROM:
+                hint = "from"
+            elif prev in _PREV_TO:
+                hint = "to"
+        found.append({"place": place, "hint": hint})
+    return found
+
+
+def assign_route(found):
+    """Topilgan joylardan (qayerdan, qayerga) ni ajratadi."""
+    origin = next((f for f in found if f["hint"] == "from"), None)
+    dest = next((f for f in found if f["hint"] == "to" and f is not origin), None)
+    rest = [f for f in found if f is not origin and f is not dest]
+    if origin is None and rest:
+        origin = rest.pop(0)
+    if dest is None and rest:
+        dest = rest.pop(0)
+    return (origin["place"] if origin else None, dest["place"] if dest else None)
+
+
+def place_label(name, country):
+    """'Тошкент (Ўзбекистон)'; davlatning o'zi bo'lsa faqat nomi."""
+    if not name:
+        return "?"
+    name = cap(name)
+    if country and normalize_city(country) != normalize_city(name):
+        return f"{name} ({country})"
+    return name
 
 
 def haversine_km(c1, c2) -> float:
@@ -403,11 +641,13 @@ def haversine_km(c1, c2) -> float:
 
 def estimate_trip(yuklash: str, manzil: str):
     """51/52/59-band: taxminiy masofa (km), vaqt (soat), yoqilg'i xarajati (so'm)."""
-    c1, c2 = find_city_coords(yuklash or ""), find_city_coords(manzil or "")
-    if not c1 or not c2:
+    p1, p2 = lookup_place(yuklash), lookup_place(manzil)
+    if not p1 or not p2 or not p1.coords or not p2.coords:
         return None
-    straight = haversine_km(c1, c2)
+    straight = haversine_km(p1.coords, p2.coords)
     road_km = straight * 1.3  # yo'l egriligi uchun taxminiy koeffitsient
+    if road_km < 1:
+        return None
     hours = road_km / 55  # o'rtacha yuk mashinasi tezligi
     fuel_l = road_km / 100 * 32  # o'rtacha sarf, litr/100km
     fuel_cost = fuel_l * DIESEL_PRICE
@@ -467,16 +707,21 @@ PARSE_PROMPT = """Sen O'zbekistondagi yuk tashish brokerisan. Quyidagi xabar \
 — yuk yoki mashina haqidagi xabar, so'zlashuv uslubidagi o'zbek/rus aralash matn. \
 Undan quyidagi maydonlarni ol va FAQAT JSON obyekt qaytar, boshqa hech qanday matn yozma:
 
-{{"yuklash": string yoki null, "manzil": string yoki null, "yuk_turi": string yoki null, \
-"mashina_turi": string yoki null, "soni": number yoki null, "dona": number yoki null, \
+{{"yuklash": string yoki null, "yuklash_davlat": string yoki null, \
+"manzil": string yoki null, "manzil_davlat": string yoki null, \
+"yuk_turi": string yoki null, "mashina_turi": string yoki null, \
+"soni": number yoki null, "dona": number yoki null, \
 "tonna": number yoki null, "kub": number yoki null, "tolov": string yoki null}}
 
 MUHIM qoidalar:
 - soni — FAQAT kerakli/mavjud MASHINALAR soni. Tovar/buyum soni bo'lsa "dona"ga yoz.
-- yuklash/manzil — shahar/joy nomi. Aniq tanib bo'lmasa, asl yozilishini o'zgartirmay qaytar.
+- yuklash/manzil — shahar yoki joy nomi. Aniq tanib bo'lmasa, asl yozilishini o'zgartirmay qaytar.
+- yuklash_davlat/manzil_davlat — o'sha shahar joylashgan davlat (masalan Ўзбекистон, Россия, \
+Чехия, Хитой, Қозоғистон). Agar yuklash/manzilning o'zi davlat bo'lsa yoki davlatni bilmasang — null.
 - mashina_turi — kuzov turi (тент, изотерма va h.k.), faqat aniq aytilgan bo'lsa.
+- tonna — raqam; agar oraliq aytilgan bo'lsa ("7-8 тонна") shu oraliqni matn sifatida yoz ("7-8").
 - tolov — to'lov turi, qisqa ("нақд", "ўтказма"), bo'lmasa null.
-MUHIM: yuklash, manzil, yuk_turi, mashina_turi, tolov — bu matn maydonlarining \
+MUHIM: yuklash, manzil, davlat nomlari, yuk_turi, mashina_turi, tolov — bu matn maydonlarining \
 barchasini FAQAT KIRILL alifbosida qaytar, hatto foydalanuvchi lotin yozuvida \
 yozgan bo'lsa ham. Aniq tanib bo'lmasa, harflarini kirillga almashtirib yoz.
 Noaniq maydonni taxmin qilma — null qoldir. HECH QACHON matnda yo'q raqam yoki \
@@ -486,26 +731,87 @@ bo'lsa-yu, tonna yoki kub aytilmagan bo'lsa, ularni albatta null qoldir.
 Matn: "{text}"
 """
 
+# Kuzov turlari va yuk turlari (AI kalitsiz ishlaganda ham topish uchun).
+BODY_TYPES = [
+    (r"тент|tent", "тент"),
+    (r"рефриж|refrij|\bреф\w*|\bref\w*", "рефрижератор"),
+    (r"изотерм|izoterm", "изотерма"),
+    (r"бортов|bortov", "бортовой"),
+]
+CARGO_WORDS = [
+    (r"текстил|tekstil|textil", "Текстиль"),
+    (r"мебел|mebel", "Мебель"),
+    (r"интернет|internet", "Интернет товар"),
+    (r"лифт|lift", "Лифт"),
+    (r"электрон|elektron", "Электроника"),
+    (r"одежд|kiyim", "Кийим-кечак"),
+    (r"озиқ|oziq|продукт|mahsulot", "Озиқ-овқат"),
+    (r"мева|meva|овощ|sabzavot|фрукт", "Мева-сабзавот"),
+    (r"қурилиш|qurilish|стройматериал", "Қурилиш материаллари"),
+    (r"запчаст|ehtiyot", "Эҳтиёт қисмлар"),
+    (r"оборудован|uskuna|jihoz", "Ускуна"),
+]
+
+_NUM = r"(\d+(?:[.,]\d+)?)"
+
+
+def _to_number(s):
+    v = float(s.replace(",", "."))
+    return int(v) if v.is_integer() else v
+
 
 def fallback_parse(text: str) -> dict:
+    """AI kalitsiz ishlaydigan oddiy parser: raqamlar + shaharlar lug'ati + kalit so'zlar."""
+    low = text.lower()
+
     def find(pattern):
         m = re.search(pattern, text, re.IGNORECASE)
         return m.group(1) if m else None
 
-    soni = find(r"(\d+)\s*(?:та|ta)\b")
-    tonna = find(r"(\d+(?:[.,]\d+)?)\s*тонн")
-    kub = find(r"(\d+(?:[.,]\d+)?)\s*куб")
+    # tonna: oraliq ("7-8 тонна") yoki bitta son
+    tonna = None
+    rng = re.search(_NUM + r"\s*[-–—]\s*" + _NUM + r"\s*(?:тонн\w*|tonn\w*|тн\b)", text, re.IGNORECASE)
+    if rng:
+        tonna = f"{rng.group(1)}-{rng.group(2)}".replace(",", ".")
+    else:
+        one = find(_NUM + r"\s*(?:тонн\w*|tonn\w*|тн\b)")
+        tonna = _to_number(one) if one else None
+
+    kub = find(_NUM + r"\s*(?:куб\w*|kub\w*|м3|м³|m3)")
     dona = find(r"(\d+)\s*(?:шт|дона|dona)\b")
+    soni = find(r"(\d+)\s*(?:машин|mashin)")
+    if not soni:
+        # "3 та тент" -> 3 ta mashina; "2 та лифт" -> 2 dona yuk
+        m = re.search(r"(\d+)\s*(?:та\b|ta\b)(?:\s+(\w+))?", text, re.IGNORECASE)
+        if m:
+            nxt = (m.group(2) or "").lower()
+            if nxt and any(re.search(pat, nxt) for pat, _ in CARGO_WORDS):
+                dona = dona or m.group(1)
+            else:
+                soni = m.group(1)
+
     tolov = None
-    if re.search(r"накд|нақд|naqd", text, re.IGNORECASE):
+    if re.search(r"накд|нақд|naqd|наличн", low):
         tolov = "нақд"
-    elif re.search(r"перечисл|o'tkazma|otkazma|ўтказма", text, re.IGNORECASE):
+    elif re.search(r"перечисл|перевод|o'tkazma|otkazma|ўтказма", low):
         tolov = "ўтказма"
+
+    mashina_turi = next((name for pat, name in BODY_TYPES if re.search(pat, low)), None)
+    yuk_turi = next((name for pat, name in CARGO_WORDS if re.search(pat, low)), None)
+
+    origin, dest = assign_route(find_places(text))
+
     return {
-        "yuklash": None, "manzil": None, "yuk_turi": None, "mashina_turi": None,
-        "soni": int(soni) if soni else None, "dona": int(dona) if dona else None,
-        "tonna": float(tonna.replace(",", ".")) if tonna else None,
-        "kub": float(kub.replace(",", ".")) if kub else None, "tolov": tolov,
+        "yuklash": origin.display if origin else None,
+        "yuklash_davlat": origin.country if origin else None,
+        "manzil": dest.display if dest else None,
+        "manzil_davlat": dest.country if dest else None,
+        "yuk_turi": yuk_turi, "mashina_turi": mashina_turi,
+        "soni": int(soni) if soni else None,
+        "dona": int(dona) if dona else None,
+        "tonna": tonna,
+        "kub": _to_number(kub) if kub else None,
+        "tolov": tolov,
     }
 
 
@@ -515,7 +821,7 @@ def parse_with_claude(text: str) -> dict:
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     resp = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=400,
+        max_tokens=500,
         messages=[{"role": "user", "content": PARSE_PROMPT.format(text=text)}],
     )
     raw = "".join(b.text for b in resp.content if b.type == "text")
@@ -538,11 +844,21 @@ def sanitize_numbers(p: dict, text: str) -> dict:
     """AI matnda yo'q raqamni o'ylab topmasligi uchun tekshiruv."""
     for key in ("soni", "dona", "tonna", "kub"):
         val = p.get(key)
-        if val is None:
+        if val is None or val == "":
+            p[key] = None
             continue
-        as_int = str(int(val)) if float(val).is_integer() else None
-        as_float = str(val)
-        if not (as_float in text or (as_int and as_int in text)):
+        if isinstance(val, str):
+            forms = {val, val.replace(",", ".")}
+        else:
+            try:
+                f = float(val)
+            except (TypeError, ValueError):
+                p[key] = None
+                continue
+            forms = {str(val), str(f), str(f).replace(".", ",")}
+            if f.is_integer():
+                forms.add(str(int(f)))
+        if not any(x in text for x in forms):
             p[key] = None
     return p
 
@@ -557,6 +873,17 @@ def cap(s):
         return s
     s = str(s).strip()
     return s[0].upper() + s[1:]
+
+
+def fmt_num(v):
+    """8.0 -> 8, 7.5 -> 7.5, '7-8' -> '7-8'."""
+    if isinstance(v, str):
+        return v
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return str(int(f)) if f.is_integer() else str(f)
 
 
 SEASONAL_EMOJI = {
@@ -575,24 +902,27 @@ def format_template(kind: str, p: dict) -> str:
     header = "\U0001F4E6 \u0417\u0410\u041f\u0420\u041e\u0421" if kind == "zapros" else "\U0001F69B \u041c\u0410\u0428\u0418\u041d\u0410 \u0411\u041e\u0420"
     season = seasonal_prefix()
     lines.append((season + " " if season else "") + header)
-    route = f"{cap(p.get('yuklash')) or '?'} \u2192 {cap(p.get('manzil')) or '?'}"
+    route = (
+        f"{place_label(p.get('yuklash'), p.get('yuklash_davlat'))} \u2192 "
+        f"{place_label(p.get('manzil'), p.get('manzil_davlat'))}"
+    )
     if p.get("round_trip"):
         route += " \U0001F501"  # borib-kelish belgisi
     lines.append(f"\U0001F4CD {route}")
     if p.get("yuk_turi"):
         lines.append(f"\U0001F4E6 \u042E\u043A: {p['yuk_turi']}")
     if p.get("dona"):
-        lines.append(f"\U0001F522 \u041C\u0438\u049B\u0434\u043E\u0440: {p['dona']} \u0434\u043E\u043D\u0430")
+        lines.append(f"\U0001F522 \u041C\u0438\u049B\u0434\u043E\u0440: {fmt_num(p['dona'])} \u0434\u043E\u043D\u0430")
     bits = []
     if p.get("soni"):
         mt = p.get("mashina_turi")
-        bits.append(f"{p['soni']} \u0442\u0430 {mt if mt else '\u043C\u0430\u0448\u0438\u043D\u0430'}")
+        bits.append(f"{fmt_num(p['soni'])} \u0442\u0430 {mt if mt else '\u043C\u0430\u0448\u0438\u043D\u0430'}")
     elif p.get("mashina_turi"):
         bits.append(cap(p["mashina_turi"]))
     if p.get("tonna"):
-        bits.append(f"{p['tonna']} \u0442\u043E\u043D\u043D\u0430")
+        bits.append(f"{fmt_num(p['tonna'])} \u0442\u043E\u043D\u043D\u0430")
     if p.get("kub"):
-        bits.append(f"{p['kub']} \u043A\u0443\u0431")
+        bits.append(f"{fmt_num(p['kub'])} \u043A\u0443\u0431")
     if bits:
         lines.append(f"\U0001F69B {', '.join(bits)}")
     if p.get("sana"):
@@ -607,8 +937,20 @@ def format_template(kind: str, p: dict) -> str:
 # Bitta yozuvni to'liq qayta ishlash (parse + shablon)
 # --------------------------------------------------------------------------
 
+def apply_places(p: dict) -> dict:
+    """Shahar nomini lug'atdagi bir xil yozuvga keltiradi va davlatini qo'yadi."""
+    for key, ckey in (("yuklash", "yuklash_davlat"), ("manzil", "manzil_davlat")):
+        ent = lookup_place(p.get(key))
+        if ent:
+            p[key] = ent.display
+            p[ckey] = ent.country
+        elif not p.get(key):
+            p[ckey] = None
+    return p
+
+
 def build_entry(text: str, kind: str) -> dict:
-    p = parse_text(text)
+    p = apply_places(parse_text(text))
     p["sana"] = extract_date_hint(text)
     p["round_trip"] = is_round_trip(text)
     p["_kind"] = kind
@@ -618,11 +960,16 @@ def build_entry(text: str, kind: str) -> dict:
 
 
 def looks_multi(text: str) -> list:
+    """Bir necha alohida yozuv: bo'sh qator bilan ajratilgan bloklar, yoki
+    har bir qatori to'liq (joy + raqam bor) bo'lsa. Bitta zaprosning ko'p qatorli
+    yozilishi bo'linmaydi."""
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+    if len(blocks) >= 2:
+        return blocks
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    if len(lines) < 2:
-        return []
-    substantive = [l for l in lines if re.search(r"\d", l)]
-    return lines if len(substantive) >= 2 else []
+    if len(lines) >= 2 and all(find_places(l) and re.search(r"\d", l) for l in lines):
+        return lines
+    return []
 
 
 # --------------------------------------------------------------------------
@@ -631,11 +978,11 @@ def looks_multi(text: str) -> list:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Salom! Menga yuk yoki mashina haqida yozing.\n\n"
+        "Salom! \U0001F44B Pastdagi menyudan tanlang yoki to'g'ridan-to'g'ri xabar/rasm yuboring.\n\n"
         "Masalan:\n"
         "\u2022 Toshkentdan Qarshiga 3 ta tent 22 tonna kerak naqd (ZAPROS)\n"
-        "\u2022 Samarqandda 2 ta mashina bor, 20 tonnagacha (MASHINA BOR)\n\n"
-        "Buyruqlar: /moshinalar /stat /excel /til"
+        "\u2022 Samarqandda 2 ta mashina bor, 20 tonnagacha (MASHINA BOR)",
+        reply_markup=main_menu(),
     )
 
 
@@ -695,13 +1042,21 @@ async def cmd_moshinalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     now = datetime.now(TZ) if TZ else datetime.now()
-    week_ago = now - timedelta(days=7)
-    s = stats_between(week_ago, now)
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today = stats_between(start_of_day, now)
+    week = stats_between(now - timedelta(days=7), now)
+    active = count_active_trucks(user_id)
     text = (
-        f"\U0001F4CA So'nggi 7 kun:\n"
-        f"\U0001F4E6 Zapros: {s.get('zapros', 0)}\n"
-        f"\U0001F69B Mashina: {s.get('mashina', 0)}"
+        f"\U0001F4CA Hisobot\n\n"
+        f"Bugun:\n"
+        f"\U0001F4E6 Zapros: {today.get('zapros', 0)}\n"
+        f"\U0001F69B Mashina: {today.get('mashina', 0)}\n\n"
+        f"So'nggi 7 kun:\n"
+        f"\U0001F4E6 Zapros: {week.get('zapros', 0)}\n"
+        f"\U0001F69B Mashina: {week.get('mashina', 0)}\n\n"
+        f"Ro'yxatdagi faol mashinalar: {active}"
     )
     await update.message.reply_text(text)
 
@@ -789,23 +1144,16 @@ async def present_entry(update: Update, user_id: int, kind: str, p: dict):
     await send_trip_info(update, p)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text:
-        return
+async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, forced_kind=None):
+    """Matnni (yozilgan yoki rasmdan o'qilgan) tahlil qilib, tasdiq so'raydi."""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    AWAITING_EDIT.pop(chat_id, None)
-
     thinking = await update.message.reply_text(t("thinking", user_id))
 
-    lines = looks_multi(text)
-    if lines:  # 1-band: ko'p yozuvli xabar
+    blocks = looks_multi(text)
+    if blocks:  # 1-band: ko'p yozuvli xabar
         await thinking.delete()
-        entries = []
-        for line in lines:
-            kind = classify_kind(line) or "zapros"
-            entries.append(build_entry(line, kind))
+        entries = [build_entry(b, forced_kind or classify_kind(b) or "zapros") for b in blocks]
         PENDING_MULTI[chat_id] = entries
         preview = "\n\n\u2015\u2015\u2015\n\n".join(e["_template"] for e in entries)
         await update.message.reply_text(
@@ -817,9 +1165,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    kind = classify_kind(text)
+    kind = forced_kind or classify_kind(text)
     if not kind:  # noaniq — foydalanuvchidan so'raladi
         await thinking.delete()
+        if not ANTHROPIC_API_KEY and is_ambiguous(apply_places(parse_text(text))):
+            # ma'lumot umuman yo'q ("Груз ведро") — turini so'rab o'tirmaymiz
+            await update.message.reply_text(t("need_more", user_id))
+            return
         PENDING_KIND[chat_id] = text
         await update.message.reply_text(t("which_kind", user_id), reply_markup=kind_keyboard())
         return
@@ -827,6 +1179,157 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p = build_entry(text, kind)
     await thinking.delete()
     await present_entry(update, user_id, kind, p)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    chat_id = update.effective_chat.id
+    if text in MENU_TEXTS:  # pastki menyu tugmasi bosildi
+        AWAITING_EDIT.pop(chat_id, None)
+        return await handle_menu(update, context, text)
+    edited = AWAITING_EDIT.pop(chat_id, None)
+    forced = MODE.pop(chat_id, None) or (edited if isinstance(edited, str) else None)
+    await process_text(update, context, text, forced)
+
+
+# --------------------------------------------------------------------------
+# Rasm: rasmdagi matnni o'qib, zapros/mashina ekanini ajratadi (AI kaliti kerak)
+# --------------------------------------------------------------------------
+
+IMAGE_PROMPT = """Rasmda yuk tashish (logistika) haqidagi xabar yoki e'lon bor. \
+Rasmdagi matnni o'qi va FAQAT JSON obyekt qaytar, boshqa hech narsa yozma:
+
+{"kind": "zapros" yoki "mashina" yoki null, "text": "..."}
+
+- text — rasmdagi asosiy xabar matni, so'zma-so'z ko'chirilgan (o'zbek/rus/lotin/kirill \
+qanday yozilgan bo'lsa shunday). Bir nechta alohida e'lon bo'lsa, har birini bo'sh qator bilan ajrat.
+- kind — yuk yoki mashina KERAK bo'lsa "zapros"; bo'sh mashina/transport BOR bo'lsa "mashina"; \
+aralash yoki noaniq bo'lsa null.
+- Rasmda yuk yoki mashina haqida hech narsa bo'lmasa, text ni bo'sh qoldir. \
+Matnda yo'q narsani o'zingdan qo'shma."""
+
+
+def read_image_with_claude(image_bytes: bytes) -> dict:
+    import base64
+    from anthropic import Anthropic
+
+    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    b64 = base64.standard_b64encode(image_bytes).decode()
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1200,
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+            {"type": "text", "text": IMAGE_PROMPT},
+        ]}],
+    )
+    raw = "".join(b.text for b in resp.content if b.type == "text")
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        raise ValueError("JSON topilmadi")
+    return json.loads(match.group(0))
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    if not ANTHROPIC_API_KEY:
+        await update.message.reply_text(t("photo_need_key", user_id))
+        return
+    thinking = await update.message.reply_text(t("reading_photo", user_id))
+    try:
+        photo = update.message.photo[-1]
+        tg_file = await photo.get_file()
+        data = bytes(await tg_file.download_as_bytearray())
+        result = await asyncio.to_thread(read_image_with_claude, data)
+    except Exception:
+        log.exception("rasmni o'qishda xato")
+        await thinking.edit_text(t("photo_failed", user_id))
+        return
+    await thinking.delete()
+
+    text = (result.get("text") or "").strip()
+    caption = (update.message.caption or "").strip()
+    if caption:
+        text = f"{caption}\n{text}".strip()
+    if not text:
+        await update.message.reply_text(t("photo_nothing", user_id))
+        return
+    kind = result.get("kind") if result.get("kind") in ("zapros", "mashina") else None
+    forced = MODE.pop(chat_id, None) or kind
+    await process_text(update, context, text, forced)
+
+
+# --------------------------------------------------------------------------
+# Pastki doimiy menyu (bank botidagidek katta tugmalar)
+# --------------------------------------------------------------------------
+
+MENU_ROWS = [
+    ["\U0001F4E6 Zapros yozish", "\U0001F69B Mashina qo'shish"],
+    ["\U0001F69B Mening mashinalarim", "\U0001F4CA Hisobot"],
+    ["\U0001F4E5 Excel", "\U0001F9F9 Eskilarini tozalash"],
+    ["\U0001F310 Til", "\u2139\uFE0F Yordam"],
+]
+MENU_TEXTS = {label for row in MENU_ROWS for label in row}
+
+HELP_TEXT = (
+    "\u2139\uFE0F Qanday ishlaydi:\n\n"
+    "\U0001F4E6 Zapros yozish \u2014 yuk yoki mashina KERAK bo'lsa, matn yozing yoki rasm yuboring. "
+    "Bot shablon qilib, tasdiqlaganingizdan keyin kanalga joylaydi.\n\n"
+    "\U0001F69B Mashina qo'shish \u2014 bo'sh mashina BOR bo'lsa. Ro'yxatga saqlanadi, kanalga chiqmaydi.\n\n"
+    "\U0001F69B Mening mashinalarim \u2014 saqlangan mashinalar (band qilish, tahrirlash, o'chirish).\n"
+    "\U0001F4CA Hisobot \u2014 bugungi va haftalik statistika.\n"
+    "\U0001F4E5 Excel \u2014 barcha yozuvlar Excel faylda.\n\n"
+    "Misol: Самарканд - Пятигорск 7-8 тонна тент керак нақд"
+)
+
+
+def main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        MENU_ROWS,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Yuk yoki mashina haqida yozing...",
+    )
+
+
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    label = text
+    if label == MENU_ROWS[0][0]:
+        MODE[chat_id] = "zapros"
+        await update.message.reply_text(
+            "\U0001F4E6 Zaprosni yozing (yoki rasm yuboring).\n\nMasalan:\n"
+            "Тошкент - Самарқанд 22 тонна тент керак нақд"
+        )
+    elif label == MENU_ROWS[0][1]:
+        MODE[chat_id] = "mashina"
+        await update.message.reply_text(
+            "\U0001F69B Mashina ma'lumotini yozing (yoki rasm yuboring).\n\nMasalan:\n"
+            "Самарқандда 2 та тент бор, 20 тонна, Россияга юради"
+        )
+    elif label == MENU_ROWS[1][0]:
+        await send_truck_list(update, user_id, chat_id, context)
+    elif label == MENU_ROWS[1][1]:
+        await cmd_stat(update, context)
+    elif label == MENU_ROWS[2][0]:
+        await cmd_excel(update, context)
+    elif label == MENU_ROWS[2][1]:
+        n = delete_old_trucks(user_id, days=3)
+        await update.message.reply_text(f"{n} {t('cleared_old', user_id)}")
+    elif label == MENU_ROWS[3][0]:
+        await update.message.reply_text(
+            "Tilni tanlang / \u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u044f\u0437\u044b\u043a:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("\U0001F1FA\U0001F1FF O'zbekcha", callback_data="lang:uz"),
+                InlineKeyboardButton("\U0001F1F7\U0001F1FA \u0420\u0443\u0441\u0441\u043a\u0438\u0439", callback_data="lang:ru"),
+            ]]),
+        )
+    elif label == MENU_ROWS[3][1]:
+        await update.message.reply_text(HELP_TEXT)
 
 
 async def handle_kind_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -895,6 +1398,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"{sent}/{len(entries)} ta yozuv qayta ishlandi \u2705")
         return
 
+    if data.startswith("lang:"):
+        lang = data.split(":")[1]
+        set_lang(user_id, lang)
+        await query.edit_message_text("\u0413\u043e\u0442\u043e\u0432\u043e \u2705" if lang == "ru" else "Bo'ldi \u2705")
+        return
+
     if data.startswith("tsort:"):
         order = data.split(":")[1]
         await send_truck_list(update, user_id, chat_id, context, order=order)
@@ -932,7 +1441,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = get_entry(entry_id)
         if row:
             hard_delete_entry(entry_id)
-            AWAITING_EDIT[chat_id] = True
+            AWAITING_EDIT[chat_id] = row["kind"] or True
             await query.edit_message_text(t("edit_prompt", user_id))
         return
 
@@ -964,7 +1473,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "edit":
-        AWAITING_EDIT[chat_id] = True
+        AWAITING_EDIT[chat_id] = pending[0] if pending else True
         await query.edit_message_text(t("edit_prompt", user_id))
         return
 
@@ -1014,11 +1523,22 @@ async def notify_admin(context, text: str):
 
 
 async def on_startup(application: Application):
+    try:  # ko'k "Menyu" tugmasidagi buyruqlar ro'yxati
+        await application.bot.set_my_commands([
+            BotCommand("start", "Boshlash / menyu"),
+            BotCommand("moshinalar", "Mening mashinalarim"),
+            BotCommand("stat", "Hisobot"),
+            BotCommand("excel", "Excel yuklab olish"),
+            BotCommand("til", "Til (uz/ru)"),
+        ])
+    except Exception:
+        log.exception("buyruqlar ro'yxatini o'rnatib bo'lmadi")
     if ADMIN_CHAT_ID:
         try:
             await application.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=f"\u2705 Bot ishga tushdi \u2014 {datetime.now():%d.%m.%Y %H:%M}",
+                reply_markup=main_menu(),
             )
         except Exception:
             log.exception("startup xabarini yuborib bo'lmadi")
@@ -1084,6 +1604,7 @@ def main():
     app.add_handler(CommandHandler("stat", cmd_stat))
     app.add_handler(CommandHandler("excel", cmd_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_error_handler(on_error)
 
