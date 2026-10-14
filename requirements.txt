@@ -1,3 +1,4 @@
 python-telegram-bot[job-queue]==21.6
-anthropic==0.39.0
+google-genai
 openpyxl==3.1.5
+
