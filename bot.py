@@ -47,9 +47,12 @@ import httpx
 
 from telegram import (
     BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ParseMode
@@ -611,9 +614,16 @@ def gemini_json(parts: list) -> dict:
         },
         timeout=45,
     )
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        # Google xato matni (kalit qiymatini o'z ichiga olmaydi) Logs'da ko'rinadi
+        raise RuntimeError(f"Gemini {resp.status_code} ({GEMINI_MODEL}): {resp.text[:300]}")
     data = resp.json()
-    raw = "".join(part.get("text", "") for part in data["candidates"][0]["content"]["parts"])
+    candidates = data.get("candidates") or []
+    out_parts = ((candidates[0].get("content") or {}).get("parts")) if candidates else None
+    if not out_parts:
+        reason = candidates[0].get("finishReason") if candidates else data.get("promptFeedback")
+        raise ValueError(f"Gemini bo'sh javob qaytardi: {reason}")
+    raw = "".join(part.get("text", "") for part in out_parts)
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if not match:
         raise ValueError("JSON topilmadi")
@@ -1302,14 +1312,28 @@ async def notify_admin(context, text: str):
 
 
 async def on_startup(application: Application):
+    full_commands = [
+        BotCommand("start", "Boshlash / menyu"),
+        BotCommand("moshinalar", "Mening mashinalarim"),
+        BotCommand("stat", "Hisobot"),
+        BotCommand("excel", "Excel yuklab olish"),
+        BotCommand("til", "Til (uz/ru)"),
+    ]
     try:  # ko'k "Menyu" tugmasidagi buyruqlar ro'yxati
-        await application.bot.set_my_commands([
-            BotCommand("start", "Boshlash / menyu"),
-            BotCommand("moshinalar", "Mening mashinalarim"),
-            BotCommand("stat", "Hisobot"),
-            BotCommand("excel", "Excel yuklab olish"),
-            BotCommand("til", "Til (uz/ru)"),
-        ])
+        if ALLOWED_USER_IDS:
+            # Hamma uchun faqat /start; to'liq ro'yxat faqat ruxsat etilganlarga
+            await application.bot.set_my_commands(
+                [BotCommand("start", "Boshlash")], scope=BotCommandScopeDefault()
+            )
+            for uid in ALLOWED_USER_IDS:
+                try:
+                    await application.bot.set_my_commands(
+                        full_commands, scope=BotCommandScopeChat(chat_id=uid)
+                    )
+                except Exception:
+                    log.warning("ID %s uchun buyruqlar ro'yxatini o'rnatib bo'lmadi", uid)
+        else:
+            await application.bot.set_my_commands(full_commands)
     except Exception:
         log.exception("buyruqlar ro'yxatini o'rnatib bo'lmadi")
     if ADMIN_CHAT_ID:
@@ -1373,11 +1397,20 @@ def stranger_text() -> str:
     )
 
 
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram ID'ni ko'rsatadi (ruxsat ro'yxatiga qo'shish uchun kerak)."""
+    await update.message.reply_text(f"Sizning Telegram ID: {update.effective_user.id}")
+
+
 async def access_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Eng birinchi ishlaydi. Ruxsati yo'q odamning hech bir xabari botga yetib bormaydi."""
     user = update.effective_user
     if user is None or not ALLOWED_USER_IDS or user.id in ALLOWED_USER_IDS:
         return  # o'tkazib yuboriladi (ro'yxat bo'sh bo'lsa, bot hamma uchun ochiq)
+
+    msg_text = (update.message.text or "").strip() if update.message else ""
+    if msg_text and msg_text.split()[0].split("@")[0].lower() == "/id":
+        return  # /id hamma uchun ochiq (faqat o'z ID'sini ko'rsatadi)
 
     chat = update.effective_chat
     if update.callback_query:
@@ -1389,9 +1422,7 @@ async def access_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await update.message.reply_text(
                     stranger_text(),
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("\U0001F4E2 Kanalga a'zo bo'lish", url=CHANNEL_URL)
-                    ]]),
+                    reply_markup=ReplyKeyboardRemove(),  # eski menyu tugmalarini yashiradi
                 )
             except Exception:
                 log.exception("begona foydalanuvchiga javob yuborib bo'lmadi")
@@ -1416,6 +1447,7 @@ def main():
     )
 
     app.add_handler(TypeHandler(Update, access_gate), group=-1)
+    app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("til", cmd_til))
     app.add_handler(CommandHandler("moshinalar", cmd_moshinalar))
