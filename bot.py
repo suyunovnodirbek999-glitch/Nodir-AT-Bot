@@ -1,228 +1,1446 @@
-import os
+# -*- coding: utf-8 -*-
+"""
+Yuk reestri bot — V2
+
+Yangi imkoniyatlar (so'ralgan raqamlar bo'yicha):
+  1  - bir xabarda bir nechta yozuvni alohida ajratish
+  4  - sana/muddatni aniqlash
+  5  - ikki tomonlama (borib-kelish) yo'nalishni aniqlash
+ 10  - noaniq xabarga qo'shimcha ma'lumot so'rash
+ 12  - yuborishdan oldin "Tahrirlash" tugmasi
+ 19  - yuborilgan postni keyin o'chirish tugmasi
+ 20  - kun oxirida kunlik yig'ma hisobot (61 bilan birlashtirilgan)
+ 22  - haftalik/oylik hisobot (65 bilan birlashtirilgan, /stat bilan ham)
+ 26  - Excel eksport (/excel)
+ 35  - postga aloqa (telefon) qo'shish
+ 51  - masofani taxminiy hisoblash
+ 52  - yoqilg'i xarajatini taxminiy hisoblash
+ 59  - yetkazish vaqtini taxminiy hisoblash
+ 61  - kunlik avtomatik hisobot (admin'ga)
+ 65  - haftalik avtomatik hisobot (admin'ga)
+ 68  - bot qayta ishga tushganda admin'ga xabar
+ 69  - xatolik bo'lsa admin'ga xabar
+ 81  - /til — bot interfeysi tili (uz/ru)
+ 90  - bayram kunlarida shablonga qisqa mavsumiy emoji
+
+Routing:
+  - "zapros" (yuk/mashina KERAK)  -> kanalga post qilinadi
+  - "mashina bor" (bo'sh transport) -> faqat shaxsiy chatingizda ro'yxatga
+    saqlanadi (haqiqiy Telegram "Избранное"ga botlar umuman yoza olmaydi,
+    shu sabab bu ro'yxat uning o'rnini bosadi: /moshinalar bilan ko'rasiz)
+
+Muhim eslatma: SQLite fayli Railway'da doimiy diskka ulanmagan bo'lsa,
+qayta deploy qilinganda tozalanadi. Doimiy saqlash uchun Railway'da
+"Volume" qo'shish kerak (Settings -> Volumes).
+"""
+
+import asyncio
+import base64
 import json
-import sqlite3
 import logging
-from datetime import datetime
-from openpyxl import Workbook
-from google import genai
-from google.genai import types
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import os
+import re
+import sqlite3
+from datetime import datetime, timedelta, time as dtime
+
+import httpx
+
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
+    CallbackQueryHandler,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
+    TypeHandler,
     filters,
 )
 
-logging.basicConfig(level=logging.INFO)
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python <3.9 fallback (odatda kerak bo'lmaydi)
+    ZoneInfo = None
 
-# Railway Variables'dan o'zgaruvchilarni olish
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@yuklar_at")
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("yuk-bot")
 
-# Admin ID raqamlari (Vergul bilan ajratib yozish ham mumkin)
-raw_admins = os.getenv("ADMIN_ID", os.getenv("ADMIN_IDS", ""))
-ALLOWED_USERS = [int(x.strip()) for x in raw_admins.split(",") if x.strip().isdigit()]
+# --------------------------------------------------------------------------
+# Sozlamalar (muhit o'zgaruvchilari)
+# --------------------------------------------------------------------------
 
-ADMIN_URL = "https://t.me/nodirbek_logist"
-CHANNEL_URL = "https://t.me/yuklar_at"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+AI_ENABLED = bool(GEMINI_API_KEY)
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")  # sizning shaxsiy Telegram ID'ingiz
+CONTACT_PHONE = os.environ.get("CONTACT_PHONE", "+998509999709")
+DIESEL_PRICE = float(os.environ.get("DIESEL_PRICE", "12000"))  # so'm/litr, taxminiy
+TIMEZONE_NAME = os.environ.get("TIMEZONE", "Asia/Tashkent")
+DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR", "20"))  # 20:00
 
-# Gemini Flash mijozini ulash
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# Botdan faqat ruxsat etilgan foydalanuvchilar foydalanadi: ADMIN_CHAT_ID (siz) va
+# ixtiyoriy ravishda ALLOWED_USER_IDS="111,222". Qolganlarga avtomatik javob yuboriladi.
+CHANNEL_URL = os.environ.get("CHANNEL_URL", "https://t.me/yuklar_at")
+CONTACT_USERNAME = os.environ.get("CONTACT_USERNAME", "@nodirbek_logist")
+ALLOWED_USER_IDS = {
+    int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip().isdigit()
+}
+if ADMIN_CHAT_ID.strip().isdigit():
+    ALLOWED_USER_IDS.add(int(ADMIN_CHAT_ID))
+STRANGER_REPLY_COOLDOWN = 3600  # bir odamga avtomatik javob: soatiga bir marta
+_LAST_STRANGER_REPLY: dict[int, float] = {}
 
-DB_PATH = "yuklar.db"
+TZ = ZoneInfo(TIMEZONE_NAME) if ZoneInfo else None
+DB_PATH = os.environ.get("DB_PATH", "yuk_bot.db")
+
+# {chat_id: True}  — "Tahrirlash" bosilgach, keyingi xabar qayta ishlanadi
+AWAITING_EDIT: dict[int, object] = {}  # tur (zapros/mashina) yoki True
+# {chat_id: 'zapros' | 'mashina'}  — menyu tugmasi bosilgach, keyingi xabar shu turda
+MODE: dict[int, str] = {}
+# {chat_id: [entry, entry, ...]}  — ko'p yozuvli xabar tasdiqni kutmoqda
+PENDING_MULTI: dict[int, list] = {}
+# {chat_id: text}  — turi (zapros/mashina) noaniq, tugma orqali so'ralmoqda
+PENDING_KIND: dict[int, str] = {}
+
+# --------------------------------------------------------------------------
+# Ma'lumotlar bazasi
+# --------------------------------------------------------------------------
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS yuklar (
+    conn = db()
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sana TEXT,
-            turi TEXT,
-            qayerdan TEXT,
-            qayerga TEXT,
-            vazni TEXT,
-            transport TEXT,
-            narx TEXT,
-            aloqa TEXT,
-            asl_matn TEXT
-        )
-    """)
+            user_id INTEGER,
+            kind TEXT,
+            yuklash TEXT, manzil TEXT, yuk_turi TEXT, mashina_turi TEXT,
+            soni INTEGER, dona INTEGER, tonna REAL, kub REAL,
+            tolov TEXT, sana TEXT, round_trip INTEGER,
+            template TEXT,
+            channel_message_id INTEGER,
+            status TEXT DEFAULT 'active',
+            created_at TEXT
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            lang TEXT DEFAULT 'uz'
+        )"""
+    )
     conn.commit()
     conn.close()
 
 
-def check_whitelist(user_id: int) -> bool:
-    if not ALLOWED_USERS:
-        return True
-    return user_id in ALLOWED_USERS
+def get_lang(user_id: int) -> str:
+    conn = db()
+    row = conn.execute("SELECT lang FROM users WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    return row["lang"] if row else "uz"
 
 
-async def send_access_denied(update: Update):
-    keyboard = [
-        [InlineKeyboardButton("👨‍💻 Admin bilan bog‘lanish", url=ADMIN_URL)],
-        [InlineKeyboardButton("📢 Kanalimizga obuna bo‘lish", url=CHANNEL_URL)],
-    ]
-    markup = InlineKeyboardMarkup(keyboard)
-    text = (
-        "⛔️ <b>Kechirasiz, bu bot faqat ruxsat etilgan foydalanuvchilar uchun ishlaydi!</b>\n\n"
-        "Botdan foydalanish yoki hamkorlik bo‘yicha murojaat qilish uchun admin bilan bog‘laning "
-        "hamda rasmiy kanalimizni kuzatib boring:"
+def set_lang(user_id: int, lang: str):
+    conn = db()
+    conn.execute(
+        "INSERT INTO users (user_id, lang) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET lang=excluded.lang",
+        (user_id, lang),
     )
-    await update.message.reply_text(text, reply_markup=markup, parse_mode="HTML")
-
-
-def parse_cargo_with_gemini(text: str) -> dict:
-    prompt = f"""
-Quyidagi logistika xabarini tahlil qil va ma'lumotlarni aniq JSON formatda qaytar.
-Agar shahar yoki davlat nomi xato, ruscha yoki qisqartma bo'lsa ham to'g'ri topib,
-yoniga o'sha davlat bayrog'i emojisini qo'sh (masalan: "🇺🇿 Toshkent", "🇷🇺 Moskva", "🇰🇿 Olmaota").
-
-JSON maydonlari:
-- "turi": agar yuk yoki mashina kerak bo'lsa "zapros", agar bo'sh mashina bor bo'lsa "mashina_bor"
-- "qayerdan": jo'nash manzili (bayroq + shahar/davlat)
-- "qayerga": borish manzili (bayroq + shahar/davlat)
-- "vazni": yuk og'irligi yoki hajmi (masalan: "22 tonna", noma'lum bo'lsa "Ko'rsatilmagan")
-- "transport": transport turi (masalan: "Tent", "Ref", "Fura", noma'lum bo'lsa "Standart")
-- "narx": stavka yoki to'lov turi (noma'lum bo'lsa "Kelishiladi")
-- "aloqa": telefon raqam yoki username (noma'lum bo'lsa "@nodirbek_logist")
-- "izoh": yuk nomi yoki qo'shimcha ma'lumot
-
-Xabar matni:
-{text}
-"""
-    response = client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-        ),
-    )
-    return json.loads(response.text)
-
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not check_whitelist(update.effective_user.id):
-        await send_access_denied(update)
-        return
-
-    await update.message.reply_text(
-        "✅ <b>Assalomu alaykum! Logistika bot ishga tayyor.</b>\n\n"
-        "📝 Yuk yoki transport haqidagi xabarni yuboring — Gemini AI shaharlarni avtomatik aniqlab, bazaga saqlaydi va kanalga chiqaradi.\n\n"
-        "📊 /excel — Barcha yuklar ro‘yxatini Excel (.xlsx) formatda yuklab olish\n"
-        "🆔 /id — O‘z Telegram ID raqamingizni ko‘rish",
-        parse_mode="HTML",
-    )
-
-
-async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Sizning Telegram ID raqamingiz: <code>{update.effective_user.id}</code>",
-        parse_mode="HTML",
-    )
-
-
-async def excel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not check_whitelist(update.effective_user.id):
-        await send_access_denied(update)
-        return
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, sana, turi, qayerdan, qayerga, vazni, transport, narx, aloqa FROM yuklar ORDER BY id DESC")
-    rows = c.fetchall()
+    conn.commit()
     conn.close()
 
+
+def save_entry(user_id: int, kind: str, p: dict, template: str) -> int:
+    conn = db()
+    cur = conn.execute(
+        """INSERT INTO entries
+           (user_id, kind, yuklash, manzil, yuk_turi, mashina_turi, soni, dona,
+            tonna, kub, tolov, sana, round_trip, template, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            user_id, kind, p.get("yuklash"), p.get("manzil"), p.get("yuk_turi"),
+            p.get("mashina_turi"), p.get("soni"), p.get("dona"), p.get("tonna"),
+            p.get("kub"), p.get("tolov"), p.get("sana"), int(bool(p.get("round_trip"))),
+            template, datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+    entry_id = cur.lastrowid
+    conn.close()
+    return entry_id
+
+
+def set_channel_message(entry_id: int, message_id: int):
+    conn = db()
+    conn.execute("UPDATE entries SET channel_message_id=? WHERE id=?", (message_id, entry_id))
+    conn.commit()
+    conn.close()
+
+
+def set_status(entry_id: int, status: str):
+    conn = db()
+    conn.execute("UPDATE entries SET status=? WHERE id=?", (status, entry_id))
+    conn.commit()
+    conn.close()
+
+
+def recent_trucks(user_id: int, limit: int = 30, order: str = "date"):
+    conn = db()
+    order_sql = "created_at DESC" if order == "date" else "yuklash COLLATE NOCASE ASC"
+    rows = conn.execute(
+        f"SELECT * FROM entries WHERE user_id=? AND kind='mashina' AND status != 'deleted' "
+        f"ORDER BY {order_sql} LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def count_active_trucks(user_id: int) -> int:
+    conn = db()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM entries WHERE user_id=? AND kind='mashina' AND status='active'",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return row["c"] if row else 0
+
+
+def get_entry(entry_id: int):
+    conn = db()
+    row = conn.execute("SELECT * FROM entries WHERE id=?", (entry_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def hard_delete_entry(entry_id: int):
+    conn = db()
+    conn.execute("DELETE FROM entries WHERE id=?", (entry_id,))
+    conn.commit()
+    conn.close()
+
+
+def delete_old_trucks(user_id: int, days: int = 3) -> int:
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "DELETE FROM entries WHERE user_id=? AND kind='mashina' AND created_at < ?",
+        (user_id, cutoff),
+    )
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n
+
+
+def delete_all_trucks(user_id: int) -> int:
+    conn = db()
+    cur = conn.execute("DELETE FROM entries WHERE user_id=? AND kind='mashina'", (user_id,))
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n
+
+
+def expire_old_entries(days: int = 7) -> int:
+    """11-band: 7 kundan eski faol yozuvlarni avtomatik olib tashlaydi."""
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "DELETE FROM entries WHERE created_at < ? AND status != 'deleted'", (cutoff,)
+    )
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n
+
+
+def find_matching_trucks(user_id: int, yuklash: str, manzil: str):
+    """12-band: yangi zaprosga mos saqlangan mashina bormi, tekshiradi."""
+    if not yuklash or not manzil:
+        return []
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM entries WHERE user_id=? AND kind='mashina' AND status='active' "
+        "AND yuklash IS NOT NULL AND manzil IS NOT NULL",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    y_key, m_key = normalize_city(yuklash), normalize_city(manzil)
+    return [
+        r for r in rows
+        if normalize_city(r["yuklash"]) == y_key and normalize_city(r["manzil"]) == m_key
+    ]
+
+
+def time_ago(created_at: str) -> str:
+    try:
+        then = datetime.fromisoformat(created_at)
+    except Exception:
+        return ""
+    now = datetime.now(TZ) if TZ and then.tzinfo else datetime.now()
+    delta = now - then if then.tzinfo == now.tzinfo else datetime.now() - then.replace(tzinfo=None)
+    seconds = max(delta.total_seconds(), 0)
+    if seconds < 3600:
+        return f"{int(seconds // 60)} daqiqa oldin"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} soat oldin"
+    return f"{int(seconds // 86400)} kun oldin"
+
+
+def stats_between(start: datetime, end: datetime):
+    conn = db()
+    rows = conn.execute(
+        "SELECT kind, COUNT(*) as cnt FROM entries WHERE created_at BETWEEN ? AND ? "
+        "GROUP BY kind",
+        (start.isoformat(), end.isoformat()),
+    ).fetchall()
+    conn.close()
+    return {r["kind"]: r["cnt"] for r in rows}
+
+
+def all_entries():
+    conn = db()
+    rows = conn.execute("SELECT * FROM entries ORDER BY id DESC").fetchall()
+    conn.close()
+    return rows
+
+
+# --------------------------------------------------------------------------
+# Interfeys tillari (81-band: faqat bot matnlari uchun, yuk ma'lumoti emas)
+# --------------------------------------------------------------------------
+
+UI = {
+    "thinking": {"uz": "Ishlanmoqda...", "ru": "\u041e\u0431\u0440\u0430\u0431\u0430\u0442\u044b\u0432\u0430\u044e..."},
+    "need_more": {
+        "uz": "Ma'lumot yetarli emas \U0001F914 Qayerdan, qayerga, necha tonna/kub ekanini aniqroq yozing.",
+        "ru": "\u041d\u0435\u0434\u043e\u0441\u0442\u0430\u0442\u043e\u0447\u043d\u043e \u0434\u0430\u043d\u043d\u044b\u0445 \U0001F914 \u041d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u043e\u0442\u043a\u0443\u0434\u0430, \u043a\u0443\u0434\u0430, \u0441\u043a\u043e\u043b\u044c\u043a\u043e \u0442\u043e\u043d\u043d/\u043a\u0443\u0431.",
+    },
+    "which_kind": {
+        "uz": "Bu qaysi turdagi xabar?",
+        "ru": "\u041a \u043a\u0430\u043a\u043e\u043c\u0443 \u0442\u0438\u043f\u0443 \u043e\u0442\u043d\u043e\u0441\u0438\u0442\u0441\u044f \u044d\u0442\u043e \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435?",
+    },
+    "btn_zapros": {"uz": "\U0001F4E6 Zapros (yuk kerak)", "ru": "\U0001F4E6 \u0417\u0430\u043f\u0440\u043e\u0441 (\u043d\u0443\u0436\u0435\u043d \u0433\u0440\u0443\u0437)"},
+    "btn_truck": {"uz": "\U0001F69B Mashina bor", "ru": "\U0001F69B \u0415\u0441\u0442\u044c \u043c\u0430\u0448\u0438\u043d\u0430"},
+    "template_ready": {"uz": "Shablon tayyor:", "ru": "\u0428\u0430\u0431\u043b\u043e\u043d \u0433\u043e\u0442\u043e\u0432:"},
+    "send_to_channel_q": {"uz": "Kanalga yuborilsinmi?", "ru": "\u041e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0432 \u043a\u0430\u043d\u0430\u043b?"},
+    "save_to_list_q": {"uz": "Ro'yxatga saqlansinmi?", "ru": "\u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c \u0432 \u0441\u043f\u0438\u0441\u043e\u043a?"},
+    "btn_send": {"uz": "\u2705 Kanalga yuborish", "ru": "\u2705 \u041e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0432 \u043a\u0430\u043d\u0430\u043b"},
+    "btn_save": {"uz": "\u2705 Ro'yxatga saqlash", "ru": "\u2705 \u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c"},
+    "btn_edit": {"uz": "\u270F\uFE0F Tahrirlash", "ru": "\u270F\uFE0F \u0418\u0437\u043c\u0435\u043d\u0438\u0442\u044c"},
+    "btn_cancel": {"uz": "\u274C Bekor qilish", "ru": "\u274C \u041e\u0442\u043c\u0435\u043d\u0430"},
+    "cancelled": {"uz": "Bekor qilindi.", "ru": "\u041e\u0442\u043c\u0435\u043d\u0435\u043d\u043e."},
+    "sent": {"uz": "Yuborildi:", "ru": "\u041e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e:"},
+    "saved": {"uz": "Ro'yxatga saqlandi \u2705", "ru": "\u0421\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u043e \u0432 \u0441\u043f\u0438\u0441\u043e\u043a \u2705"},
+    "edit_prompt": {
+        "uz": "\u270F\uFE0F To'g'irlangan matnni to'liq qayta yozib yuboring.",
+        "ru": "\u270F\uFE0F \u041d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u0438\u0441\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043d\u044b\u0439 \u0442\u0435\u043a\u0441\u0442 \u0437\u0430\u043d\u043e\u0432\u043e.",
+    },
+    "delete_btn": {"uz": "\U0001F5D1 Kanaldan o'chirish", "ru": "\U0001F5D1 \u0423\u0434\u0430\u043b\u0438\u0442\u044c \u0438\u0437 \u043a\u0430\u043d\u0430\u043b\u0430"},
+    "deleted": {"uz": "O'chirildi.", "ru": "\u0423\u0434\u0430\u043b\u0435\u043d\u043e."},
+    "send_all": {"uz": "\u2705 Barchasini yuborish", "ru": "\u2705 \u041e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0432\u0441\u0451"},
+    "photo_need_key": {
+        "uz": "\U0001F4F7 Rasmni o'qish uchun AI kaliti (GEMINI_API_KEY) kerak. Hozircha xabarni matn qilib yozing.",
+        "ru": "\U0001F4F7 \u0414\u043b\u044f \u0447\u0442\u0435\u043d\u0438\u044f \u0444\u043e\u0442\u043e \u043d\u0443\u0436\u0435\u043d \u043a\u043b\u044e\u0447 AI. \u041f\u043e\u043a\u0430 \u043d\u0430\u043f\u0438\u0448\u0438\u0442\u0435 \u0442\u0435\u043a\u0441\u0442\u043e\u043c.",
+    },
+    "reading_photo": {"uz": "\U0001F4F7 Rasm o'qilmoqda...", "ru": "\U0001F4F7 \u0427\u0438\u0442\u0430\u044e \u0444\u043e\u0442\u043e..."},
+    "photo_failed": {"uz": "Rasmni o'qib bo'lmadi, qayta urinib ko'ring yoki matn yozing.", "ru": "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u0440\u043e\u0447\u0438\u0442\u0430\u0442\u044c \u0444\u043e\u0442\u043e."},
+    "photo_nothing": {"uz": "Rasmda yuk yoki mashina haqida matn topilmadi.", "ru": "\u041d\u0430 \u0444\u043e\u0442\u043e \u043d\u0435\u0442 \u0434\u0430\u043d\u043d\u044b\u0445 \u043e \u0433\u0440\u0443\u0437\u0435 \u0438\u043b\u0438 \u043c\u0430\u0448\u0438\u043d\u0435."},
+    "no_trucks": {"uz": "Ro'yxat bo'sh.", "ru": "\u0421\u043f\u0438\u0441\u043e\u043a \u043f\u0443\u0441\u0442."},
+    "truck_count": {"uz": "ta faol mashina", "ru": "\u0430\u043a\u0442\u0438\u0432\u043d\u044b\u0445 \u043c\u0430\u0448\u0438\u043d"},
+    "sort_by_date": {"uz": "\U0001F4C5 Sana bo'yicha", "ru": "\U0001F4C5 \u041f\u043e \u0434\u0430\u0442\u0435"},
+    "sort_by_city": {"uz": "\U0001F4CD Shahar bo'yicha", "ru": "\U0001F4CD \u041f\u043e \u0433\u043e\u0440\u043e\u0434\u0443"},
+    "clear_old": {"uz": "\U0001F9F9 Eskilarini tozalash", "ru": "\U0001F9F9 \u041e\u0447\u0438\u0441\u0442\u0438\u0442\u044c \u0441\u0442\u0430\u0440\u044b\u0435"},
+    "clear_all": {"uz": "\U0001F5D1 Barchasini o'chirish", "ru": "\U0001F5D1 \u0423\u0434\u0430\u043b\u0438\u0442\u044c \u0432\u0441\u0435"},
+    "truck_delete": {"uz": "\U0001F5D1 O'chirish", "ru": "\U0001F5D1 \u0423\u0434\u0430\u043b\u0438\u0442\u044c"},
+    "truck_edit": {"uz": "\u270F\uFE0F Tahrirlash", "ru": "\u270F\uFE0F \u0418\u0437\u043c\u0435\u043d\u0438\u0442\u044c"},
+    "truck_mark_taken": {"uz": "\U0001F534 Band qildim", "ru": "\U0001F534 \u0417\u0430\u043d\u044f\u0442\u043e"},
+    "truck_mark_free": {"uz": "\U0001F7E2 Bo'shadi", "ru": "\U0001F7E2 \u0421\u0432\u043e\u0431\u043e\u0434\u043d\u043e"},
+    "truck_copy": {"uz": "\U0001F4CB Nusxalash", "ru": "\U0001F4CB \u041a\u043e\u043f\u0438\u0440\u043e\u0432\u0430\u0442\u044c"},
+    "truck_post": {"uz": "\U0001F4E4 Kanalga joylash", "ru": "\U0001F4E4 \u041e\u043f\u0443\u0431\u043b\u0438\u043a\u043e\u0432\u0430\u0442\u044c \u0432 \u043a\u0430\u043d\u0430\u043b"},
+    "truck_deleted": {"uz": "O'chirildi \u2705", "ru": "\u0423\u0434\u0430\u043b\u0435\u043d\u043e \u2705"},
+    "truck_status_band": {"uz": "\U0001F534 BAND", "ru": "\U0001F534 \u0417\u0410\u041d\u042f\u0422\u041e"},
+    "truck_status_free": {"uz": "\U0001F7E2 BO'SH", "ru": "\U0001F7E2 \u0421\u0412\u041e\u0411\u041e\u0414\u041d\u041e"},
+    "cleared_old": {"uz": "yozuv o'chirildi (3 kundan eski)", "ru": "\u0437\u0430\u043f\u0438\u0441\u0435\u0439 \u0443\u0434\u0430\u043b\u0435\u043d\u043e (\u0441\u0442\u0430\u0440\u0448\u0435 3 \u0434\u043d\u0435\u0439)"},
+    "cleared_all": {"uz": "yozuv butunlay o'chirildi", "ru": "\u0437\u0430\u043f\u0438\u0441\u0435\u0439 \u043f\u043e\u043b\u043d\u043e\u0441\u0442\u044c\u044e \u0443\u0434\u0430\u043b\u0435\u043d\u043e"},
+    "match_found": {
+        "uz": "\U0001F50E Ro'yxatingizda mos keladigan mashina bor:",
+        "ru": "\U0001F50E \u0412 \u0432\u0430\u0448\u0435\u043c \u0441\u043f\u0438\u0441\u043a\u0435 \u0435\u0441\u0442\u044c \u043f\u043e\u0434\u0445\u043e\u0434\u044f\u0449\u0430\u044f \u043c\u0430\u0448\u0438\u043d\u0430:",
+    },
+    "posted_to_channel": {"uz": "Kanalga joylandi \u2705", "ru": "\u041e\u043f\u0443\u0431\u043b\u0438\u043a\u043e\u0432\u0430\u043d\u043e \u0432 \u043a\u0430\u043d\u0430\u043b \u2705"},
+    "copied": {"uz": "Matn quyida, nusxalab oling:", "ru": "\u0422\u0435\u043a\u0441\u0442 \u043d\u0438\u0436\u0435, \u0441\u043a\u043e\u043f\u0438\u0440\u0443\u0439\u0442\u0435:"},
+}
+
+
+def t(key: str, user_id: int) -> str:
+    lang = get_lang(user_id)
+    return UI.get(key, {}).get(lang, UI.get(key, {}).get("uz", key))
+
+
+# --------------------------------------------------------------------------
+# Joy nomlari: shahar/davlat lug'ati olib tashlangan — endi Gemini aniqlaydi
+# (parse_with_gemini). Shahar, davlat va taxminiy masofa AI javobidan olinadi.
+# --------------------------------------------------------------------------
+
+def normalize_city(name: str) -> str:
+    """Kichik harf, faqat harf/raqam (taqqoslash uchun)."""
+    if not name:
+        return ""
+    return re.sub(r"[\W_]", "", name.lower())
+
+
+def place_label(name, country):
+    """'Тошкент (Ўзбекистон)'; davlatning o'zi bo'lsa faqat nomi."""
+    if not name:
+        return "?"
+    name = cap(name)
+    if country and normalize_city(country) != normalize_city(name):
+        return f"{name} ({country})"
+    return name
+
+
+def estimate_trip(p: dict):
+    """51/52/59-band: Gemini bergan taxminiy masofa (km) bo'yicha vaqt va yoqilg'i."""
+    try:
+        km = float(p.get("masofa_km"))
+    except (TypeError, ValueError):
+        return None
+    if km < 1 or km > 30000:
+        return None
+    hours = km / 55  # o'rtacha yuk mashinasi tezligi
+    fuel_cost = km / 100 * 32 * DIESEL_PRICE  # o'rtacha sarf, litr/100km
+    return {"km": round(km), "hours": round(hours, 1), "fuel_cost": round(fuel_cost, -3)}
+
+
+# --------------------------------------------------------------------------
+# Sana aniqlash (4-band) va borib-kelish (5-band)
+# --------------------------------------------------------------------------
+
+def extract_date_hint(text: str):
+    t_low = text.lower()
+    today = datetime.now(TZ) if TZ else datetime.now()
+    if "бугун" in t_low or "bugun" in t_low:
+        return today.strftime("%d.%m.%Y")
+    if "эртага" in t_low or "ertaga" in t_low:
+        return (today + timedelta(days=1)).strftime("%d.%m.%Y")
+    m = re.search(r"(\d+)\s*(кун|kun)дан?\s*кейин|(\d+)\s*(кун|kun)dan\s*keyin", t_low)
+    if m:
+        days = int(next(g for g in m.groups() if g and g.isdigit()))
+        return (today + timedelta(days=days)).strftime("%d.%m.%Y")
+    m2 = re.search(r"\b(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)\b", text)
+    if m2:
+        return m2.group(1)
+    return None
+
+
+def is_round_trip(text: str) -> bool:
+    t_low = text.lower()
+    return bool(re.search(r"орқага|orqaga|туда.?обратно|w{2}|va qaytish|скво?зн", t_low))
+
+
+# --------------------------------------------------------------------------
+# Turi aniqlash: zapros yoki mashina bor (routing uchun)
+# --------------------------------------------------------------------------
+
+ZAPROS_HINTS = ["керак", "kerak", "нужен", "нужна", "требуется", "izlanmoqda", "изланмоқда"]
+TRUCK_HINTS = ["бор", "bor", "свобод", "bo'sh", "bosh mashina", "холост"]
+
+
+def classify_kind(text: str):
+    t_low = text.lower()
+    has_zapros = any(h in t_low for h in ZAPROS_HINTS)
+    has_truck = any(h in t_low for h in TRUCK_HINTS)
+    if has_zapros and not has_truck:
+        return "zapros"
+    if has_truck and not has_zapros:
+        return "mashina"
+    return None  # noaniq — foydalanuvchidan so'raladi
+
+
+# --------------------------------------------------------------------------
+# Matnni AI/oddiy usulda ajratish
+# --------------------------------------------------------------------------
+
+PARSE_PROMPT = """Sen O'zbekistondagi yuk tashish brokerisan. Quyidagi xabar \
+— yuk yoki mashina haqidagi xabar, so'zlashuv uslubidagi o'zbek/rus aralash matn. \
+Undan quyidagi maydonlarni ol va FAQAT JSON obyekt qaytar, boshqa hech qanday matn yozma:
+
+{{"yuklash": string yoki null, "yuklash_davlat": string yoki null, \
+"manzil": string yoki null, "manzil_davlat": string yoki null, \
+"yuk_turi": string yoki null, "mashina_turi": string yoki null, \
+"soni": number yoki null, "dona": number yoki null, \
+"tonna": number yoki null, "kub": number yoki null, "tolov": string yoki null, "masofa_km": number yoki null}}
+
+MUHIM qoidalar:
+- soni — FAQAT kerakli/mavjud MASHINALAR soni. Tovar/buyum soni bo'lsa "dona"ga yoz.
+- yuklash/manzil — shahar yoki joy nomi. Aniq tanib bo'lmasa, asl yozilishini o'zgartirmay qaytar.
+- yuklash_davlat/manzil_davlat — o'sha shahar joylashgan davlat (masalan Ўзбекистон, Россия, \
+Чехия, Хитой, Қозоғистон). Agar yuklash/manzilning o'zi davlat bo'lsa yoki davlatni bilmasang — null.
+- mashina_turi — kuzov turi (тент, изотерма va h.k.), faqat aniq aytilgan bo'lsa.
+- tonna — raqam; agar oraliq aytilgan bo'lsa ("7-8 тонна") shu oraliqni matn sifatida yoz ("7-8").
+- tolov — to'lov turi, qisqa ("нақд", "ўтказма"), bo'lmasa null.
+- masofa_km — yuklash va manzil orasidagi taxminiy avtomobil yo'li masofasi (km, butun son); ikkala joy ham aniq bo'lmasa null.
+- Joy nomlarini standart kirill yozuvida yoz: O'zbekiston shaharlari o'zbekcha (Тошкент, Самарқанд, Бухоро, Қарши, Термиз), boshqa davlatlarniki odatdagi kirill nomida (Москва, Прага, Урумчи). Bir xil joy har doim bir xil yozilsin.
+MUHIM: yuklash, manzil, davlat nomlari, yuk_turi, mashina_turi, tolov — bu matn maydonlarining \
+barchasini FAQAT KIRILL alifbosida qaytar, hatto foydalanuvchi lotin yozuvida \
+yozgan bo'lsa ham. Aniq tanib bo'lmasa, harflarini kirillga almashtirib yoz.
+Noaniq maydonni taxmin qilma — null qoldir. HECH QACHON matnda yo'q raqam yoki \
+tafsilotni o'zingdan to'qib chiqarma — masalan matnda faqat "yuk bor" deyilgan \
+bo'lsa-yu, tonna yoki kub aytilmagan bo'lsa, ularni albatta null qoldir.
+
+Matn: "{text}"
+"""
+
+# Kuzov turlari va yuk turlari (AI kalitsiz ishlaganda ham topish uchun).
+BODY_TYPES = [
+    (r"тент|tent", "тент"),
+    (r"рефриж|refrij|\bреф\w*|\bref\w*", "рефрижератор"),
+    (r"изотерм|izoterm", "изотерма"),
+    (r"бортов|bortov", "бортовой"),
+]
+CARGO_WORDS = [
+    (r"текстил|tekstil|textil", "Текстиль"),
+    (r"мебел|mebel", "Мебель"),
+    (r"интернет|internet", "Интернет товар"),
+    (r"лифт|lift", "Лифт"),
+    (r"электрон|elektron", "Электроника"),
+    (r"одежд|kiyim", "Кийим-кечак"),
+    (r"озиқ|oziq|продукт|mahsulot", "Озиқ-овқат"),
+    (r"мева|meva|овощ|sabzavot|фрукт", "Мева-сабзавот"),
+    (r"қурилиш|qurilish|стройматериал", "Қурилиш материаллари"),
+    (r"запчаст|ehtiyot", "Эҳтиёт қисмлар"),
+    (r"оборудован|uskuna|jihoz", "Ускуна"),
+]
+
+_NUM = r"(\d+(?:[.,]\d+)?)"
+
+
+def _to_number(s):
+    v = float(s.replace(",", "."))
+    return int(v) if v.is_integer() else v
+
+
+def fallback_parse(text: str) -> dict:
+    """AI ishlamaganda oddiy parser: raqamlar + kalit so'zlar + "A - B" yo'nalishi."""
+    low = text.lower()
+
+    def find(pattern):
+        m = re.search(pattern, text, re.IGNORECASE)
+        return m.group(1) if m else None
+
+    # tonna: oraliq ("7-8 тонна") yoki bitta son
+    tonna = None
+    rng = re.search(_NUM + r"\s*[-–—]\s*" + _NUM + r"\s*(?:тонн\w*|tonn\w*|тн\b)", text, re.IGNORECASE)
+    if rng:
+        tonna = f"{rng.group(1)}-{rng.group(2)}".replace(",", ".")
+    else:
+        one = find(_NUM + r"\s*(?:тонн\w*|tonn\w*|тн\b)")
+        tonna = _to_number(one) if one else None
+
+    kub = find(_NUM + r"\s*(?:куб\w*|kub\w*|м3|м³|m3)")
+    dona = find(r"(\d+)\s*(?:шт|дона|dona)\b")
+    soni = find(r"(\d+)\s*(?:машин|mashin)")
+    if not soni:
+        # "3 та тент" -> 3 ta mashina; "2 та лифт" -> 2 dona yuk
+        m = re.search(r"(\d+)\s*(?:та\b|ta\b)(?:\s+(\w+))?", text, re.IGNORECASE)
+        if m:
+            nxt = (m.group(2) or "").lower()
+            if nxt and any(re.search(pat, nxt) for pat, _ in CARGO_WORDS):
+                dona = dona or m.group(1)
+            else:
+                soni = m.group(1)
+
+    tolov = None
+    if re.search(r"накд|нақд|naqd|наличн", low):
+        tolov = "нақд"
+    elif re.search(r"перечисл|перевод|o'tkazma|otkazma|ўтказма", low):
+        tolov = "ўтказма"
+
+    mashina_turi = next((name for pat, name in BODY_TYPES if re.search(pat, low)), None)
+    yuk_turi = next((name for pat, name in CARGO_WORDS if re.search(pat, low)), None)
+
+    route = re.search(r"([^\W\d_][\w'’ʼ`]*)\s*[-–—→>]+\s*([^\W\d_][\w'’ʼ`]*)", text)
+    origin_name = route.group(1) if route else None
+    dest_name = route.group(2) if route else None
+
+    return {
+        "yuklash": origin_name,
+        "yuklash_davlat": None,
+        "manzil": dest_name,
+        "manzil_davlat": None,
+        "masofa_km": None,
+        "yuk_turi": yuk_turi, "mashina_turi": mashina_turi,
+        "soni": int(soni) if soni else None,
+        "dona": int(dona) if dona else None,
+        "tonna": tonna,
+        "kub": _to_number(kub) if kub else None,
+        "tolov": tolov,
+    }
+
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+
+def gemini_json(parts: list) -> dict:
+    """Gemini'ga so'rov yuboradi va javobdagi JSON obyektni qaytaradi.
+    Kalit URL'da emas, sarlavhada yuboriladi (xato loglarida ko'rinib qolmasligi uchun)."""
+    resp = httpx.post(
+        GEMINI_URL.format(model=GEMINI_MODEL),
+        headers={"x-goog-api-key": GEMINI_API_KEY},
+        json={
+            "contents": [{"parts": parts}],
+            "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+        },
+        timeout=45,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    raw = "".join(part.get("text", "") for part in data["candidates"][0]["content"]["parts"])
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        raise ValueError("JSON topilmadi")
+    return json.loads(match.group(0))
+
+
+def parse_with_gemini(text: str) -> dict:
+    return gemini_json([{"text": PARSE_PROMPT.format(text=text)}])
+
+
+def parse_text(text: str) -> dict:
+    try:
+        p = parse_with_gemini(text) if AI_ENABLED else fallback_parse(text)
+    except Exception:
+        log.exception("parse xatosi")
+        p = fallback_parse(text)
+    return sanitize_numbers(p, text)
+
+
+def sanitize_numbers(p: dict, text: str) -> dict:
+    """AI matnda yo'q raqamni o'ylab topmasligi uchun tekshiruv."""
+    for key in ("soni", "dona", "tonna", "kub"):
+        val = p.get(key)
+        if val is None or val == "":
+            p[key] = None
+            continue
+        if isinstance(val, str):
+            forms = {val, val.replace(",", ".")}
+        else:
+            try:
+                f = float(val)
+            except (TypeError, ValueError):
+                p[key] = None
+                continue
+            forms = {str(val), str(f), str(f).replace(".", ",")}
+            if f.is_integer():
+                forms.add(str(int(f)))
+        if not any(x in text for x in forms):
+            p[key] = None
+    return p
+
+
+def is_ambiguous(p: dict) -> bool:
+    keys = ["yuklash", "manzil", "tonna", "kub", "soni", "dona"]
+    return not any(p.get(k) for k in keys)
+
+
+def cap(s):
+    if not s:
+        return s
+    s = str(s).strip()
+    return s[0].upper() + s[1:]
+
+
+def fmt_num(v):
+    """8.0 -> 8, 7.5 -> 7.5, '7-8' -> '7-8'."""
+    if isinstance(v, str):
+        return v
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return str(int(f)) if f.is_integer() else str(f)
+
+
+SEASONAL_EMOJI = {
+    (3, 21): "\U0001F33C",  # Navro'z
+    (1, 1): "\U0001F386",   # Yangi yil
+}
+
+
+def seasonal_prefix() -> str:
+    today = datetime.now(TZ) if TZ else datetime.now()
+    return SEASONAL_EMOJI.get((today.month, today.day), "")
+
+
+def format_template(kind: str, p: dict) -> str:
+    lines = []
+    header = "\U0001F4E6 \u0417\u0410\u041f\u0420\u041e\u0421" if kind == "zapros" else "\U0001F69B \u041c\u0410\u0428\u0418\u041d\u0410 \u0411\u041e\u0420"
+    season = seasonal_prefix()
+    lines.append((season + " " if season else "") + header)
+    route = (
+        f"{place_label(p.get('yuklash'), p.get('yuklash_davlat'))} \u2192 "
+        f"{place_label(p.get('manzil'), p.get('manzil_davlat'))}"
+    )
+    if p.get("round_trip"):
+        route += " \U0001F501"  # borib-kelish belgisi
+    lines.append(f"\U0001F4CD {route}")
+    if p.get("yuk_turi"):
+        lines.append(f"\U0001F4E6 \u042E\u043A: {p['yuk_turi']}")
+    if p.get("dona"):
+        lines.append(f"\U0001F522 \u041C\u0438\u049B\u0434\u043E\u0440: {fmt_num(p['dona'])} \u0434\u043E\u043D\u0430")
+    bits = []
+    if p.get("soni"):
+        mt = p.get("mashina_turi")
+        bits.append(f"{fmt_num(p['soni'])} \u0442\u0430 {mt if mt else '\u043C\u0430\u0448\u0438\u043D\u0430'}")
+    elif p.get("mashina_turi"):
+        bits.append(cap(p["mashina_turi"]))
+    if p.get("tonna"):
+        bits.append(f"{fmt_num(p['tonna'])} \u0442\u043E\u043D\u043D\u0430")
+    if p.get("kub"):
+        bits.append(f"{fmt_num(p['kub'])} \u043A\u0443\u0431")
+    if bits:
+        lines.append(f"\U0001F69B {', '.join(bits)}")
+    if p.get("sana"):
+        lines.append(f"\U0001F4C5 \u0421\u0430\u043D\u0430: {p['sana']}")
+    if p.get("tolov"):
+        lines.append(f"\U0001F4B0 \u0422\u045E\u043B\u043E\u0432: {p['tolov']}")
+    lines.append(f"\U0001F4DE {CONTACT_PHONE}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Bitta yozuvni to'liq qayta ishlash (parse + shablon)
+# --------------------------------------------------------------------------
+
+def apply_places(p: dict) -> dict:
+    """Joy bo'lmasa, davlatni ham bo'sh qoldiradi (nomlarni Gemini tuzatadi)."""
+    for key, ckey in (("yuklash", "yuklash_davlat"), ("manzil", "manzil_davlat")):
+        if not p.get(key):
+            p[ckey] = None
+    return p
+
+
+def build_entry(text: str, kind: str) -> dict:
+    p = apply_places(parse_text(text))
+    p["sana"] = extract_date_hint(text)
+    p["round_trip"] = is_round_trip(text)
+    p["_kind"] = kind
+    p["_template"] = format_template(kind, p)
+    p["_trip"] = estimate_trip(p)
+    return p
+
+
+_ROUTE_HINT = re.compile(r"[-–—→>]|\w(?:dan|дан|ga|га|qa|қа)\b", re.IGNORECASE)
+
+
+def looks_multi(text: str) -> list:
+    """Bir necha alohida yozuv: bo'sh qator bilan ajratilgan bloklar, yoki
+    har bir qatori to'liq (joy + raqam bor) bo'lsa. Bitta zaprosning ko'p qatorli
+    yozilishi bo'linmaydi."""
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+    if len(blocks) >= 2:
+        return blocks
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) >= 2 and all(_ROUTE_HINT.search(l) and re.search(r"\d", l) for l in lines):
+        return lines
+    return []
+
+
+# --------------------------------------------------------------------------
+# Handlerlar
+# --------------------------------------------------------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Salom! \U0001F44B Pastdagi menyudan tanlang yoki to'g'ridan-to'g'ri xabar/rasm yuboring.\n\n"
+        "Masalan:\n"
+        "\u2022 Toshkentdan Qarshiga 3 ta tent 22 tonna kerak naqd (ZAPROS)\n"
+        "\u2022 Samarqandda 2 ta mashina bor, 20 tonnagacha (MASHINA BOR)",
+        reply_markup=main_menu(),
+    )
+
+
+async def cmd_til(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if args and args[0] in ("uz", "ru"):
+        set_lang(update.effective_user.id, args[0])
+        await update.message.reply_text("OK \u2705" if args[0] == "ru" else "Bo'ldi \u2705")
+    else:
+        await update.message.reply_text("Til tanlang: /til uz  yoki  /til ru")
+
+
+def truck_keyboard(user_id: int, row) -> InlineKeyboardMarkup:
+    band = row["status"] == "band"
+    status_btn = (
+        InlineKeyboardButton(t("truck_mark_free", user_id), callback_data=f"tband:{row['id']}:0")
+        if band else
+        InlineKeyboardButton(t("truck_mark_taken", user_id), callback_data=f"tband:{row['id']}:1")
+    )
+    return InlineKeyboardMarkup([
+        [status_btn, InlineKeyboardButton(t("truck_edit", user_id), callback_data=f"tedit:{row['id']}")],
+        [InlineKeyboardButton(t("truck_copy", user_id), callback_data=f"tcopy:{row['id']}"),
+         InlineKeyboardButton(t("truck_post", user_id), callback_data=f"tpost:{row['id']}")],
+        [InlineKeyboardButton(t("truck_delete", user_id), callback_data=f"tdel:{row['id']}")],
+    ])
+
+
+def truck_entry_text(row) -> str:
+    tag = "\U0001F534 BAND\n" if row["status"] == "band" else ""
+    ago = time_ago(row["created_at"])
+    return f"{tag}{row['template']}\n\U0001F553 {ago}"
+
+
+async def send_truck_list(message_or_query, user_id: int, chat_id: int, context, order: str = "date"):
+    rows = recent_trucks(user_id, order=order)
     if not rows:
-        await update.message.reply_text("📭 Hozircha bazada saqlangan ma'lumotlar yo‘q.")
+        await context.bot.send_message(chat_id, t("no_trucks", user_id))
+        return
+    header = f"\U0001F69B {len(rows)} {t('truck_count', user_id)}"
+    await context.bot.send_message(
+        chat_id, header,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(t("sort_by_date", user_id), callback_data="tsort:date"),
+             InlineKeyboardButton(t("sort_by_city", user_id), callback_data="tsort:city")],
+            [InlineKeyboardButton(t("clear_old", user_id), callback_data="tclearold"),
+             InlineKeyboardButton(t("clear_all", user_id), callback_data="tclearall")],
+        ]),
+    )
+    for row in rows:
+        await context.bot.send_message(
+            chat_id, truck_entry_text(row), reply_markup=truck_keyboard(user_id, row)
+        )
+
+
+async def cmd_moshinalar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_truck_list(update, update.effective_user.id, update.effective_chat.id, context)
+
+
+async def cmd_stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    now = datetime.now(TZ) if TZ else datetime.now()
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today = stats_between(start_of_day, now)
+    week = stats_between(now - timedelta(days=7), now)
+    active = count_active_trucks(user_id)
+    text = (
+        f"\U0001F4CA Hisobot\n\n"
+        f"Bugun:\n"
+        f"\U0001F4E6 Zapros: {today.get('zapros', 0)}\n"
+        f"\U0001F69B Mashina: {today.get('mashina', 0)}\n\n"
+        f"So'nggi 7 kun:\n"
+        f"\U0001F4E6 Zapros: {week.get('zapros', 0)}\n"
+        f"\U0001F69B Mashina: {week.get('mashina', 0)}\n\n"
+        f"Ro'yxatdagi faol mashinalar: {active}"
+    )
+    await update.message.reply_text(text)
+
+
+async def cmd_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        await update.message.reply_text("openpyxl o'rnatilmagan (requirements.txt ga qo'shing).")
         return
 
+    rows = all_entries()
     wb = Workbook()
     ws = wb.active
-    ws.title = "Yuklar Reestri"
-    ws.append(["ID", "Sana", "Turi", "Qayerdan", "Qayerga", "Vazni", "Transport", "Narx", "Aloqa"])
-
+    ws.title = "Reestr"
+    ws.append(["Sana", "Turi", "Yuklash", "Manzil", "Soni", "Dona", "Tonna", "Kub", "Yuk turi", "To'lov"])
     for r in rows:
-        ws.append(list(r))
+        ws.append([
+            r["created_at"][:10], r["kind"], r["yuklash"], r["manzil"],
+            r["soni"], r["dona"], r["tonna"], r["kub"], r["yuk_turi"], r["tolov"],
+        ])
+    path = "/tmp/yuk_reestri.xlsx"
+    wb.save(path)
+    await update.message.reply_document(document=open(path, "rb"), filename="yuk_reestri.xlsx")
 
-    file_name = "yuklar_hisoboti.xlsx"
-    wb.save(file_name)
 
-    with open(file_name, "rb") as f:
-        await update.message.reply_document(document=f, filename=file_name, caption="📊 Barcha yuklar reestri")
+def kind_keyboard(index: int = None):
+    prefix = f"k{index}:" if index is not None else "k:"
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("\U0001F4E6 Zapros", callback_data=f"{prefix}zapros"),
+        InlineKeyboardButton("\U0001F69B Mashina bor", callback_data=f"{prefix}mashina"),
+    ]])
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+def confirm_keyboard(user_id: int, kind: str, token: str):
+    send_label = t("btn_send", user_id) if kind == "zapros" else t("btn_save", user_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(send_label, callback_data=f"go:{token}")],
+        [
+            InlineKeyboardButton(t("btn_edit", user_id), callback_data=f"edit:{token}"),
+            InlineKeyboardButton(t("btn_cancel", user_id), callback_data=f"cancel:{token}"),
+        ],
+    ])
+
+
+# Vaqtinchalik xotira: token -> (kind, parsed dict) tasdiqni kutayotgan yozuvlar
+PENDING_ENTRY: dict[str, tuple] = {}
+_token_seq = 0
+
+
+def new_token() -> str:
+    global _token_seq
+    _token_seq += 1
+    return str(_token_seq)
+
+
+async def send_trip_info(update: Update, p: dict):
+    trip = p.get("_trip")
+    if not trip:
+        return
+    text = (
+        f"\U0001F4CF Taxminiy masofa: {trip['km']} km\n"
+        f"\u23F1 Taxminiy vaqt: {trip['hours']} soat\n"
+        f"\u26FD Taxminiy yoqilg'i xarajati: {trip['fuel_cost']:,.0f} so'm".replace(",", " ")
+    )
+    await update.message.reply_text(text + "\n\n(faqat siz uchun, kanalga chiqmaydi)")
+
+
+async def present_entry(update: Update, user_id: int, kind: str, p: dict):
+    if is_ambiguous(p):
+        await update.message.reply_text(t("need_more", user_id))
+        return
+    token = new_token()
+    PENDING_ENTRY[token] = (kind, p)
+    label = t("send_to_channel_q", user_id) if kind == "zapros" else t("save_to_list_q", user_id)
+    await update.message.reply_text(
+        f"{t('template_ready', user_id)}\n\n{p['_template']}\n\n{label}",
+        reply_markup=confirm_keyboard(user_id, kind, token),
+    )
+    if kind == "zapros":
+        matches = find_matching_trucks(user_id, p.get("yuklash"), p.get("manzil"))
+        if matches:
+            preview = "\n\n\u2015\u2015\u2015\n\n".join(m["template"] for m in matches[:3])
+            await update.message.reply_text(f"{t('match_found', user_id)}\n\n{preview}")
+    await send_trip_info(update, p)
+
+
+async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, forced_kind=None):
+    """Matnni (yozilgan yoki rasmdan o'qilgan) tahlil qilib, tasdiq so'raydi."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    thinking = await update.message.reply_text(t("thinking", user_id))
+
+    blocks = looks_multi(text)
+    if blocks:  # 1-band: ko'p yozuvli xabar
+        await thinking.delete()
+        entries = [await asyncio.to_thread(build_entry, b, forced_kind or classify_kind(b) or "zapros") for b in blocks]
+        PENDING_MULTI[chat_id] = entries
+        preview = "\n\n\u2015\u2015\u2015\n\n".join(e["_template"] for e in entries)
+        await update.message.reply_text(
+            f"{len(entries)} ta yozuv topildi:\n\n{preview}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(t("send_all", user_id), callback_data="multi:send"),
+                InlineKeyboardButton(t("btn_cancel", user_id), callback_data="multi:cancel"),
+            ]]),
+        )
         return
 
-    if not check_whitelist(update.effective_user.id):
-        await send_access_denied(update)
+    kind = forced_kind or classify_kind(text)
+    if not kind:  # noaniq — foydalanuvchidan so'raladi
+        await thinking.delete()
+        if not AI_ENABLED and is_ambiguous(parse_text(text)):
+            # ma'lumot umuman yo'q ("Груз ведро") — turini so'rab o'tirmaymiz
+            await update.message.reply_text(t("need_more", user_id))
+            return
+        PENDING_KIND[chat_id] = text
+        await update.message.reply_text(t("which_kind", user_id), reply_markup=kind_keyboard())
         return
 
-    wait_msg = await update.message.reply_text("⏳ Tahlil qilinmoqda...")
+    p = await asyncio.to_thread(build_entry, text, kind)
+    await thinking.delete()
+    await present_entry(update, user_id, kind, p)
 
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    chat_id = update.effective_chat.id
+    if text in MENU_TEXTS:  # pastki menyu tugmasi bosildi
+        AWAITING_EDIT.pop(chat_id, None)
+        return await handle_menu(update, context, text)
+    edited = AWAITING_EDIT.pop(chat_id, None)
+    forced = MODE.pop(chat_id, None) or (edited if isinstance(edited, str) else None)
+    await process_text(update, context, text, forced)
+
+
+# --------------------------------------------------------------------------
+# Rasm: rasmdagi matnni o'qib, zapros/mashina ekanini ajratadi (AI kaliti kerak)
+# --------------------------------------------------------------------------
+
+IMAGE_PROMPT = """Rasmda yuk tashish (logistika) haqidagi xabar yoki e'lon bor. \
+Rasmdagi matnni o'qi va FAQAT JSON obyekt qaytar, boshqa hech narsa yozma:
+
+{"kind": "zapros" yoki "mashina" yoki null, "text": "..."}
+
+- text — rasmdagi asosiy xabar matni, so'zma-so'z ko'chirilgan (o'zbek/rus/lotin/kirill \
+qanday yozilgan bo'lsa shunday). Bir nechta alohida e'lon bo'lsa, har birini bo'sh qator bilan ajrat.
+- kind — yuk yoki mashina KERAK bo'lsa "zapros"; bo'sh mashina/transport BOR bo'lsa "mashina"; \
+aralash yoki noaniq bo'lsa null.
+- Rasmda yuk yoki mashina haqida hech narsa bo'lmasa, text ni bo'sh qoldir. \
+Matnda yo'q narsani o'zingdan qo'shma."""
+
+
+def read_image_with_gemini(image_bytes: bytes) -> dict:
+    b64 = base64.standard_b64encode(image_bytes).decode()
+    return gemini_json([
+        {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+        {"text": IMAGE_PROMPT},
+    ])
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    if not AI_ENABLED:
+        await update.message.reply_text(t("photo_need_key", user_id))
+        return
+    thinking = await update.message.reply_text(t("reading_photo", user_id))
     try:
-        data = parse_cargo_with_gemini(update.message.text)
-        sana = datetime.now().strftime("%Y-%m-%d %H:%M")
+        photo = update.message.photo[-1]
+        tg_file = await photo.get_file()
+        data = bytes(await tg_file.download_as_bytearray())
+        result = await asyncio.to_thread(read_image_with_gemini, data)
+    except Exception:
+        log.exception("rasmni o'qishda xato")
+        await thinking.edit_text(t("photo_failed", user_id))
+        return
+    await thinking.delete()
 
-        turi = data.get("turi", "zapros")
-        qayerdan = data.get("qayerdan", "Noma'lum")
-        qayerga = data.get("qayerga", "Noma'lum")
-        vazni = data.get("vazni", "Ko'rsatilmagan")
-        transport = data.get("transport", "Standart")
-        narx = data.get("narx", "Kelishiladi")
-        aloqa = data.get("aloqa", "@nodirbek_logist")
-        izoh = data.get("izoh", "")
+    text = (result.get("text") or "").strip()
+    caption = (update.message.caption or "").strip()
+    if caption:
+        text = f"{caption}\n{text}".strip()
+    if not text:
+        await update.message.reply_text(t("photo_nothing", user_id))
+        return
+    kind = result.get("kind") if result.get("kind") in ("zapros", "mashina") else None
+    forced = MODE.pop(chat_id, None) or kind
+    await process_text(update, context, text, forced)
 
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO yuklar (sana, turi, qayerdan, qayerga, vazni, transport, narx, aloqa, asl_matn) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (sana, turi, qayerdan, qayerga, vazni, transport, narx, aloqa, update.message.text),
+
+# --------------------------------------------------------------------------
+# Pastki doimiy menyu (bank botidagidek katta tugmalar)
+# --------------------------------------------------------------------------
+
+MENU_ROWS = [
+    ["\U0001F4E6 Zapros yozish", "\U0001F69B Mashina qo'shish"],
+    ["\U0001F69B Mening mashinalarim", "\U0001F4CA Hisobot"],
+    ["\U0001F4E5 Excel", "\U0001F9F9 Eskilarini tozalash"],
+    ["\U0001F310 Til", "\u2139\uFE0F Yordam"],
+]
+MENU_TEXTS = {label for row in MENU_ROWS for label in row}
+
+HELP_TEXT = (
+    "\u2139\uFE0F Qanday ishlaydi:\n\n"
+    "\U0001F4E6 Zapros yozish \u2014 yuk yoki mashina KERAK bo'lsa, matn yozing yoki rasm yuboring. "
+    "Bot shablon qilib, tasdiqlaganingizdan keyin kanalga joylaydi.\n\n"
+    "\U0001F69B Mashina qo'shish \u2014 bo'sh mashina BOR bo'lsa. Ro'yxatga saqlanadi, kanalga chiqmaydi.\n\n"
+    "\U0001F69B Mening mashinalarim \u2014 saqlangan mashinalar (band qilish, tahrirlash, o'chirish).\n"
+    "\U0001F4CA Hisobot \u2014 bugungi va haftalik statistika.\n"
+    "\U0001F4E5 Excel \u2014 barcha yozuvlar Excel faylda.\n\n"
+    "Misol: Самарканд - Пятигорск 7-8 тонна тент керак нақд"
+)
+
+
+def main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        MENU_ROWS,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Yuk yoki mashina haqida yozing...",
+    )
+
+
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    label = text
+    if label == MENU_ROWS[0][0]:
+        MODE[chat_id] = "zapros"
+        await update.message.reply_text(
+            "\U0001F4E6 Zaprosni yozing (yoki rasm yuboring).\n\nMasalan:\n"
+            "Тошкент - Самарқанд 22 тонна тент керак нақд"
         )
-        conn.commit()
-        conn.close()
-
-        post_text = (
-            f"📦 <b>YANGI YUK / TRANSPORT E'LONI</b>\n\n"
-            f"📍 <b>Yo‘nalish:</b> {qayerdan} ➡️ {qayerga}\n"
-            f"⚖️ <b>Vazni / Hajmi:</b> {vazni}\n"
-            f"🚛 <b>Transport turi:</b> {transport}\n"
-            f"💰 <b>To‘lov / Narx:</b> {narx}\n"
+    elif label == MENU_ROWS[0][1]:
+        MODE[chat_id] = "mashina"
+        await update.message.reply_text(
+            "\U0001F69B Mashina ma'lumotini yozing (yoki rasm yuboring).\n\nMasalan:\n"
+            "Самарқандда 2 та тент бор, 20 тонна, Россияга юради"
         )
-        if izoh:
-            post_text += f"📝 <b>Qo‘shimcha:</b> {izoh}\n"
-        post_text += f"\n📞 <b>Murojaat uchun:</b> {aloqa}\n📢 <b>Kanal:</b> @yuklar_at"
+    elif label == MENU_ROWS[1][0]:
+        await send_truck_list(update, user_id, chat_id, context)
+    elif label == MENU_ROWS[1][1]:
+        await cmd_stat(update, context)
+    elif label == MENU_ROWS[2][0]:
+        await cmd_excel(update, context)
+    elif label == MENU_ROWS[2][1]:
+        n = delete_old_trucks(user_id, days=3)
+        await update.message.reply_text(f"{n} {t('cleared_old', user_id)}")
+    elif label == MENU_ROWS[3][0]:
+        await update.message.reply_text(
+            "Tilni tanlang / \u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u044f\u0437\u044b\u043a:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("\U0001F1FA\U0001F1FF O'zbekcha", callback_data="lang:uz"),
+                InlineKeyboardButton("\U0001F1F7\U0001F1FA \u0420\u0443\u0441\u0441\u043a\u0438\u0439", callback_data="lang:ru"),
+            ]]),
+        )
+    elif label == MENU_ROWS[3][1]:
+        await update.message.reply_text(HELP_TEXT)
 
-        if turi == "zapros" and CHANNEL_ID:
+
+async def handle_kind_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    kind = query.data.split(":")[1]
+    text = PENDING_KIND.pop(chat_id, None)
+    if not text:
+        await query.edit_message_text(t("cancelled", user_id))
+        return
+    p = await asyncio.to_thread(build_entry, text, kind)
+    await query.edit_message_text(f"{t('template_ready', user_id)}\n\n{p['_template']}")
+    if is_ambiguous(p):
+        await context.bot.send_message(chat_id, t("need_more", user_id))
+        return
+    token = new_token()
+    PENDING_ENTRY[token] = (kind, p)
+    label = t("send_to_channel_q", user_id) if kind == "zapros" else t("save_to_list_q", user_id)
+    await context.bot.send_message(
+        chat_id, label, reply_markup=confirm_keyboard(user_id, kind, token)
+    )
+    if kind == "zapros":
+        matches = find_matching_trucks(user_id, p.get("yuklash"), p.get("manzil"))
+        if matches:
+            preview = "\n\n\u2015\u2015\u2015\n\n".join(m["template"] for m in matches[:3])
+            await context.bot.send_message(chat_id, f"{t('match_found', user_id)}\n\n{preview}")
+
+
+async def deliver_entry(context, user_id: int, kind: str, p: dict):
+    """Zaprosni kanalga, mashina ma'lumotini shaxsiy ro'yxatga yozadi."""
+    entry_id = save_entry(user_id, kind, p, p["_template"])
+    if kind == "zapros" and CHANNEL_ID:
+        msg = await context.bot.send_message(chat_id=CHANNEL_ID, text=p["_template"])
+        set_channel_message(entry_id, msg.message_id)
+        return entry_id, msg.message_id
+    return entry_id, None
+
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if data.startswith("k:") or (data.startswith("k") and ":" in data and PENDING_KIND):
+        return await handle_kind_choice(update, context)
+
+    if data == "multi:cancel":
+        PENDING_MULTI.pop(chat_id, None)
+        await query.edit_message_text(t("cancelled", user_id))
+        return
+
+    if data == "multi:send":
+        entries = PENDING_MULTI.pop(chat_id, [])
+        sent = 0
+        for e in entries:
+            kind = e["_kind"]
             try:
-                await context.bot.send_message(chat_id=CHANNEL_ID, text=post_text, parse_mode="HTML")
-                status_note = "✅ <i>Kanalga joylandi va bazaga saqlandi!</i>"
-            except Exception as e:
-                status_note = f"⚠️ <i>Bazaga saqlandi (Kanalga yuborishda xatolik: {e})</i>"
+                await deliver_entry(context, user_id, kind, e)
+                sent += 1
+            except Exception:
+                log.exception("multi yuborishda xato")
+        await query.edit_message_text(f"{sent}/{len(entries)} ta yozuv qayta ishlandi \u2705")
+        return
+
+    if data.startswith("lang:"):
+        lang = data.split(":")[1]
+        set_lang(user_id, lang)
+        await query.edit_message_text("\u0413\u043e\u0442\u043e\u0432\u043e \u2705" if lang == "ru" else "Bo'ldi \u2705")
+        return
+
+    if data.startswith("tsort:"):
+        order = data.split(":")[1]
+        await send_truck_list(update, user_id, chat_id, context, order=order)
+        return
+
+    if data == "tclearold":
+        n = delete_old_trucks(user_id, days=3)
+        await query.edit_message_text(f"{n} {t('cleared_old', user_id)}")
+        return
+
+    if data == "tclearall":
+        n = delete_all_trucks(user_id)
+        await query.edit_message_text(f"{n} {t('cleared_all', user_id)}")
+        return
+
+    if data.startswith("tdel:"):
+        entry_id = int(data.split(":")[1])
+        hard_delete_entry(entry_id)
+        await query.edit_message_text(t("truck_deleted", user_id))
+        return
+
+    if data.startswith("tband:"):
+        _, entry_id, flag = data.split(":")
+        row = get_entry(int(entry_id))
+        if row:
+            set_status(int(entry_id), "band" if flag == "1" else "active")
+            row = get_entry(int(entry_id))
+            await query.edit_message_text(
+                truck_entry_text(row), reply_markup=truck_keyboard(user_id, row)
+            )
+        return
+
+    if data.startswith("tedit:"):
+        entry_id = int(data.split(":")[1])
+        row = get_entry(entry_id)
+        if row:
+            hard_delete_entry(entry_id)
+            AWAITING_EDIT[chat_id] = row["kind"] or True
+            await query.edit_message_text(t("edit_prompt", user_id))
+        return
+
+    if data.startswith("tcopy:"):
+        entry_id = int(data.split(":")[1])
+        row = get_entry(entry_id)
+        if row:
+            await query.answer(t("copied", user_id), show_alert=False)
+            await context.bot.send_message(chat_id, row["template"])
+        return
+
+    if data.startswith("tpost:"):
+        entry_id = int(data.split(":")[1])
+        row = get_entry(entry_id)
+        if row and CHANNEL_ID:
+            try:
+                await context.bot.send_message(chat_id=CHANNEL_ID, text=row["template"])
+                await query.answer(t("posted_to_channel", user_id), show_alert=False)
+            except Exception:
+                log.exception("kanalga joylashda xato")
+        return
+
+    action, token = (data.split(":", 1) + [None])[:2]
+    pending = PENDING_ENTRY.get(token) if token else None
+
+    if action == "cancel":
+        PENDING_ENTRY.pop(token, None)
+        await query.edit_message_text(t("cancelled", user_id))
+        return
+
+    if action == "edit":
+        AWAITING_EDIT[chat_id] = pending[0] if pending else True
+        await query.edit_message_text(t("edit_prompt", user_id))
+        return
+
+    if action == "go" and pending:
+        kind, p = pending
+        PENDING_ENTRY.pop(token, None)
+        try:
+            entry_id, msg_id = await deliver_entry(context, user_id, kind, p)
+        except Exception as exc:
+            log.exception("yuborishda xato")
+            await query.edit_message_text(f"Xato: {exc}")
+            await notify_admin(context, f"\u26A0\uFE0F Yuborishda xato: {exc}")
+            return
+        if kind == "zapros" and msg_id:
+            await query.edit_message_text(
+                f"{t('sent', user_id)}\n\n{p['_template']}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(t("delete_btn", user_id), callback_data=f"del:{entry_id}:{msg_id}")
+                ]]),
+            )
         else:
-            status_note = "💾 <i>Bo‘sh transport sifatida shaxsiy bazaga saqlandi!</i>"
+            await query.edit_message_text(f"{t('saved', user_id)}\n\n{p['_template']}")
+        return
 
-        await wait_msg.edit_text(f"{post_text}\n\n{status_note}", parse_mode="HTML")
+    if action == "del":
+        _, entry_id, msg_id = data.split(":")
+        try:
+            await context.bot.delete_message(chat_id=CHANNEL_ID, message_id=int(msg_id))
+            set_status(int(entry_id), "deleted")
+        except Exception:
+            log.exception("o'chirishda xato")
+        await query.edit_message_text(t("deleted", user_id))
+        return
 
-    except Exception as e:
-        await wait_msg.edit_text(f"❌ Xatolik yuz berdi: {e}")
 
+# --------------------------------------------------------------------------
+# Admin bildirishnomalari (68, 69, 61, 65-band)
+# --------------------------------------------------------------------------
+
+async def notify_admin(context, text: str):
+    if not ADMIN_CHAT_ID:
+        return
+    try:
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+    except Exception:
+        log.exception("admin'ga xabar yuborib bo'lmadi")
+
+
+async def on_startup(application: Application):
+    try:  # ko'k "Menyu" tugmasidagi buyruqlar ro'yxati
+        await application.bot.set_my_commands([
+            BotCommand("start", "Boshlash / menyu"),
+            BotCommand("moshinalar", "Mening mashinalarim"),
+            BotCommand("stat", "Hisobot"),
+            BotCommand("excel", "Excel yuklab olish"),
+            BotCommand("til", "Til (uz/ru)"),
+        ])
+    except Exception:
+        log.exception("buyruqlar ro'yxatini o'rnatib bo'lmadi")
+    if ADMIN_CHAT_ID:
+        try:
+            await application.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"\u2705 Bot ishga tushdi \u2014 {datetime.now():%d.%m.%Y %H:%M}",
+                reply_markup=main_menu(),
+            )
+        except Exception:
+            log.exception("startup xabarini yuborib bo'lmadi")
+
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Handler xatosi", exc_info=context.error)
+    await notify_admin(context, f"\u26A0\uFE0F Botda xatolik:\n{context.error}")
+
+
+async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(TZ) if TZ else datetime.now()
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    s = stats_between(start_of_day, now)
+    if not s:
+        return
+    text = (
+        f"\U0001F4C5 Kunlik hisobot ({now:%d.%m.%Y}):\n"
+        f"\U0001F4E6 Zapros: {s.get('zapros', 0)}\n"
+        f"\U0001F69B Mashina: {s.get('mashina', 0)}"
+    )
+    await notify_admin(context, text)
+
+
+async def expire_job(context: ContextTypes.DEFAULT_TYPE):
+    n = expire_old_entries(days=7)
+    if n:
+        log.info("Avtomatik tozalash: %s ta eski yozuv o'chirildi", n)
+
+
+async def weekly_summary_job(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(TZ) if TZ else datetime.now()
+    week_ago = now - timedelta(days=7)
+    s = stats_between(week_ago, now)
+    text = (
+        f"\U0001F4CA Haftalik hisobot ({week_ago:%d.%m}-{now:%d.%m}):\n"
+        f"\U0001F4E6 Zapros: {s.get('zapros', 0)}\n"
+        f"\U0001F69B Mashina: {s.get('mashina', 0)}"
+    )
+    await notify_admin(context, text)
+
+
+# --------------------------------------------------------------------------
+# Kirish nazorati: ruxsatsiz foydalanuvchilarga avtomatik javob
+# --------------------------------------------------------------------------
+
+def stranger_text() -> str:
+    return (
+        "Assalomu alaykum! \U0001F44B\n\n"
+        "Yuklar bo'yicha ma'lumot olmoqchi bo'lsangiz, kanalimizga a'zo bo'ling:\n"
+        f"{CHANNEL_URL}\n\n"
+        f"yoki {CONTACT_USERNAME} ga murojaat qiling."
+    )
+
+
+async def access_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Eng birinchi ishlaydi. Ruxsati yo'q odamning hech bir xabari botga yetib bormaydi."""
+    user = update.effective_user
+    if user is None or not ALLOWED_USER_IDS or user.id in ALLOWED_USER_IDS:
+        return  # o'tkazib yuboriladi (ro'yxat bo'sh bo'lsa, bot hamma uchun ochiq)
+
+    chat = update.effective_chat
+    if update.callback_query:
+        await update.callback_query.answer()
+    elif update.message and chat and chat.type == "private":
+        now = datetime.now().timestamp()
+        if now - _LAST_STRANGER_REPLY.get(user.id, 0) >= STRANGER_REPLY_COOLDOWN:
+            _LAST_STRANGER_REPLY[user.id] = now
+            try:
+                await update.message.reply_text(
+                    stranger_text(),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("\U0001F4E2 Kanalga a'zo bo'lish", url=CHANNEL_URL)
+                    ]]),
+                )
+            except Exception:
+                log.exception("begona foydalanuvchiga javob yuborib bo'lmadi")
+    raise ApplicationHandlerStop
+
+
+# --------------------------------------------------------------------------
+# Ishga tushirish
+# --------------------------------------------------------------------------
 
 def main():
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN muhit o'zgaruvchisi kerak")
+
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("id", id_cmd))
-    app.add_handler(CommandHandler("excel", excel_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(on_startup)
+        .build()
+    )
 
+    app.add_handler(TypeHandler(Update, access_gate), group=-1)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("til", cmd_til))
+    app.add_handler(CommandHandler("moshinalar", cmd_moshinalar))
+    app.add_handler(CommandHandler("stat", cmd_stat))
+    app.add_handler(CommandHandler("excel", cmd_excel))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CallbackQueryHandler(handle_button))
+    app.add_error_handler(on_error)
+
+    if app.job_queue and TZ:
+        app.job_queue.run_daily(
+            daily_summary_job, time=dtime(hour=DAILY_SUMMARY_HOUR, tzinfo=TZ)
+        )
+        app.job_queue.run_daily(
+            weekly_summary_job, time=dtime(hour=DAILY_SUMMARY_HOUR, tzinfo=TZ),
+            days=(0,),  # dushanba
+        )
+        app.job_queue.run_daily(
+            expire_job, time=dtime(hour=3, tzinfo=TZ)
+        )
+
+    if not ALLOWED_USER_IDS:
+        log.warning("ADMIN_CHAT_ID/ALLOWED_USER_IDS bo'sh — bot hamma uchun ochiq!")
+    log.info("Bot ishga tushdi")
     app.run_polling()
 
 
